@@ -1,0 +1,55 @@
+
+logo_basegame.webp
+size: 862,159
+format: RGBA8888
+filter: Linear,Linear
+repeat: none
+banana depth
+  rotate: false
+  xy: 2, 6
+  size: 309, 151
+  orig: 311, 155
+  offset: 1, 1
+  index: -1
+bananan
+  rotate: false
+  xy: 313, 95
+  size: 293, 62
+  orig: 295, 64
+  offset: 1, 1
+  index: -1
+bonanaza depth
+  rotate: false
+  xy: 313, 9
+  size: 262, 84
+  orig: 267, 88
+  offset: 2, 2
+  index: -1
+bonanza text
+  rotate: false
+  xy: 608, 83
+  size: 252, 74
+  orig: 254, 76
+  offset: 1, 1
+  index: -1
+pill depth
+  rotate: false
+  xy: 577, 2
+  size: 115, 79
+  orig: 117, 83
+  offset: 1, 1
+  index: -1
+pill left
+  rotate: false
+  xy: 694, 18
+  size: 99, 63
+  orig: 101, 65
+  offset: 1, 1
+  index: -1
+pill shadow
+  rotate: false
+  xy: 795, 44
+  size: 65, 37
+  orig: 67, 39
+  offset: 1, 1
+  index: -1

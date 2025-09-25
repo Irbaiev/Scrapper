@@ -1,0 +1,88 @@
+
+win_screen_01_animal_safari.webp
+size: 1855,1804
+format: RGBA8888
+filter: Linear,Linear
+repeat: none
+!tinkle
+  rotate: false
+  xy: 1752, 1700
+  size: 101, 102
+  orig: 119, 119
+  offset: 9, 9
+  index: -1
+Amazing_win_glow
+  rotate: false
+  xy: 2, 1049
+  size: 1748, 753
+  orig: 1750, 755
+  offset: 1, 1
+  index: -1
+amount_meter_animal_safari
+  rotate: false
+  xy: 2, 2
+  size: 1640, 290
+  orig: 1648, 296
+  offset: 4, 3
+  index: -1
+big_win_glow
+  rotate: false
+  xy: 2, 294
+  size: 1748, 753
+  orig: 1750, 755
+  offset: 1, 1
+  index: -1
+
+win_screen_01_animal_safari2.webp
+size: 1752,1749
+format: RGBA8888
+filter: Linear,Linear
+repeat: none
+Amazing_win
+  rotate: false
+  xy: 2, 1253
+  size: 1045, 494
+  orig: 1055, 504
+  offset: 5, 5
+  index: -1
+Mega_win
+  rotate: false
+  xy: 1049, 1253
+  size: 653, 494
+  orig: 662, 504
+  offset: 4, 5
+  index: -1
+Super_win
+  rotate: false
+  xy: 2, 757
+  size: 701, 494
+  orig: 711, 504
+  offset: 5, 5
+  index: -1
+big_win
+  rotate: false
+  xy: 705, 757
+  size: 514, 494
+  orig: 523, 504
+  offset: 5, 5
+  index: -1
+mega_win_glow
+  rotate: false
+  xy: 2, 2
+  size: 1748, 753
+  orig: 1750, 755
+  offset: 1, 1
+  index: -1
+
+win_screen_01_animal_safari3.webp
+size: 1752,757
+format: RGBA8888
+filter: Linear,Linear
+repeat: none
+super_win_glow
+  rotate: false
+  xy: 2, 2
+  size: 1748, 753
+  orig: 1750, 755
+  offset: 1, 1
+  index: -1

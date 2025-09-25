@@ -1,0 +1,7 @@
+{
+  "from": "D:\\Dev\\Projects\\Game-scrapper\\offline-game-scraper\\test-capture\\bananza-improved",
+  "createdAt": "2025-09-25T13:00:10.995Z",
+  "structure": "mirror",
+  "rewriteHtml": true,
+  "prefetchMissing": false
+}

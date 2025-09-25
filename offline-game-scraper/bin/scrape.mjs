@@ -1,7 +1,19 @@
 #!/usr/bin/env node
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { capture } from '../src/capture/capture.mjs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function safeName(s) {
+  return s.replace(/[^a-z0-9_\-\.]/gi, '_').slice(0, 200);
+}
+
+async function appendNdjson(file, obj) {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.appendFile(file, JSON.stringify(obj) + '\n');
+}
 
 function parseArgs(argv) {
   const args = {};
@@ -45,6 +57,9 @@ function slugFromUrl(u) {
     scenario,
     interact,
     loadAll,
+    __dirname,
+    safeName,
+    appendNdjson,
   });
 
   console.log('\n[done] saved to:', outDir);

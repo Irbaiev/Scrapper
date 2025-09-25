@@ -11,7 +11,10 @@ export async function capture(url, {
   headless = true,
   scenario = 'default',       // default | legacy | mobile | all
   interact = 'auto',          // auto | off
-  loadAll = false
+  loadAll = false,
+  __dirname,
+  safeName,
+  appendNdjson
 } = {}) {
 
   const storageDir = path.join(outDir, 'storage');
@@ -65,23 +68,83 @@ export async function capture(url, {
 
     const page = await context.newPage();
 
-    // === WS: ловим на всём контексте (включая cross-origin iframe/воркеры) ===
-    const wsRecs = [];
-    const onWS = (ws) => {
-      const rec = { url: ws.url(), frames: [], created: Date.now(), scenario: sc };
-      ws.on('framereceived', (data) => {
-        rec.frames.push({ dir: 'in', t: Date.now(), payload: typeof data === 'string' ? data : data.toString('base64'), opcode: typeof data === 'string' ? 1 : 2 });
-      });
-      ws.on('framesent', (data) => {
-        rec.frames.push({ dir: 'out', t: Date.now(), payload: typeof data === 'string' ? data : data.toString('base64'), opcode: typeof data === 'string' ? 1 : 2 });
-      });
-      ws.on('close', () => { rec.closed = true; });
-      wsRecs.push(rec);
-    };
-    context.on('websocket', onWS);
-    page.on('websocket', onWS); // дублируем, на всякий
+    // === WebSocket хук: инжектируем до навигации ===
+    await context.exposeBinding('__wsTap', async (_source, payload) => {
+      try {
+        // Группируем по URL соединения
+        const u = new URL(payload.url);
+        const baseDir = path.join(outDir, 'ws', safeName(u.host), ...u.pathname.split('/').map(safeName));
+        const conn = payload.connId || 'unknown';
 
-    // === Network: сбор всего, в т.ч. из iframe ===
+        const metaFile = path.join(baseDir, `${conn}.meta.json`);
+        const logFile  = path.join(baseDir, `${conn}.ndjson`);
+
+        if (payload.type === 'ws-open') {
+          await fs.writeFile(metaFile, JSON.stringify({
+            url: payload.url,
+            origin: payload.origin,
+            openedAt: payload.ts
+          }, null, 2));
+        } else if (payload.type === 'ws-frame') {
+          // Сохраняем кадры: текст отдельно, бинарь — base64
+          await appendNdjson(logFile, {
+            ts: payload.ts,
+            dir: payload.dir,
+            opcode: payload.opcode,    // 1 – текст, 2 – бинарь
+            text: payload.text ?? null,
+            base64: payload.base64 ?? null
+          });
+        } else if (payload.type === 'ws-close' || payload.type === 'ws-error') {
+          await appendNdjson(logFile, payload);
+        }
+      } catch (e) {
+        // игнорируем ошибки хука
+      }
+    });
+
+    // Инжектируем WebSocket хук во все фреймы
+    await context.addInitScript({ path: path.resolve(__dirname, '../src/inject/ws-hook.js') });
+
+    // === API: ловим на уровне контекста (включая cross-origin iframe) ===
+    context.on('response', async (resp) => {
+      try {
+        const req = resp.request();
+        const type = req.resourceType();
+        if (type !== 'xhr' && type !== 'fetch') return;
+
+        const url = resp.url();
+        const u = new URL(url);
+        const ct = (resp.headers()['content-type'] || '').toLowerCase();
+        const body = await resp.body().catch(() => null);
+
+        // Куда сохранять
+        const baseDir = path.join(outDir, 'api', safeName(u.host), ...u.pathname.split('/').map(safeName));
+        const leaf = u.search ? safeName(u.search) : '';
+        const ext = ct.includes('json') ? '.json' : (ct.includes('text') ? '.txt' : '.bin');
+        const file = path.join(baseDir, (leaf || 'index') + ext);
+
+        await fs.mkdir(path.dirname(file), { recursive: true });
+        if (body) await fs.writeFile(file, body);
+
+        // мета на всякий случай
+        const meta = {
+          method: req.method(),
+          status: resp.status(),
+          headers: resp.headers(),
+          ct,
+          url
+        };
+        await fs.writeFile(file + '.meta.json', JSON.stringify(meta, null, 2));
+        
+        // Обновляем счетчики
+        counts.api++;
+        await jlog({ ev: 'api.saved', url, method: req.method(), status: resp.status(), file });
+      } catch (e) {
+        await jlog({ ev: 'api.error', error: String(e) });
+      }
+    });
+
+    // === Network: сбор ассетов (не API/WS) ===
     const failed = [];
     page.on('requestfailed', (req) => {
       failed.push({ url: req.url(), method: req.method(), failure: req.failure()?.errorText || 'failed' });
@@ -99,26 +162,10 @@ export async function capture(url, {
 
         if (/^(data:|chrome-extension:)/i.test(absUrl)) return;
 
-        // тело ответа (Playwright отдаёт, даже если другой origin)
+        // тело ответа
         let body; try { body = await resp.body(); } catch { body = Buffer.alloc(0); }
 
-        // API → отдельным файлом
-        if (isProbablyApi(contentType, absUrl, method, status)) {
-          const reqBody = await req.postDataBuffer().catch(() => null);
-          const record = {
-            time: nowTs(),
-            request: { method, url: absUrl, headers: req.headers(), bodyB64: reqBody ? Buffer.from(reqBody).toString('base64') : null },
-            response: { status, headers, contentType, bodyB64: Buffer.from(body).toString('base64') }
-          };
-          const fname = path.join(apiDir, `${Date.now()}_${Math.random().toString(36).slice(2)}.json`);
-          await fs.writeFile(fname, safeJson(record));
-          manifest.api.push({ file: path.relative(outDir, fname).replace(/\\/g,'/'), url: absUrl, method, status });
-          counts.api++;
-          await jlog({ ev: 'api.saved', url: absUrl, method, status, file: fname });
-          return;
-        }
-
-        // ассеты
+        // Только ассеты (API и WS обрабатываются хуками выше)
         const hash = sha256(body);
         const ext = pickExt(absUrl, contentType);
         const rel = path.join('storage', 'assets', `${hash}.${ext}`);
@@ -226,15 +273,7 @@ export async function capture(url, {
       }
     }
 
-    // Сохраняем WS дампы
-    let idx = 0;
-    for (const rec of wsRecs) {
-      const fname = path.join(wsDir, `${Date.now()}_${sc}_${++idx}.json`);
-      await fs.writeFile(fname, safeJson(rec));
-      manifest.ws.push({ file: path.relative(outDir, fname).replace(/\\/g,'/'), url: rec.url });
-      counts.ws++;
-    }
-    await jlog({ phase: 'scenario.end', sc, ws: wsRecs.length });
+    await jlog({ phase: 'scenario.end', sc });
 
     // Закрытие
     try { await context.close(); } catch {}

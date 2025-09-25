@@ -1,0 +1,2 @@
+// For license information, see `https://assets.adobedtm.com/1d8526a1ddc2/cff7fdda0680/199d26c90464/RC732d2b68ebd84d85b982b324e51ecac2-source.js`.
+_satellite.__registerScript('https://assets.adobedtm.com/1d8526a1ddc2/cff7fdda0680/199d26c90464/RC732d2b68ebd84d85b982b324e51ecac2-source.min.js', "_satellite.getVar(\"Store Batched Values (CWV)\",event);");

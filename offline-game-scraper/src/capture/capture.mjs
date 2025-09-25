@@ -105,16 +105,34 @@ export async function capture(url, {
     // Инжектируем WebSocket хук во все фреймы
     await context.addInitScript({ path: path.resolve(__dirname, '../src/inject/ws-hook.js') });
 
+    // === WebSocket: ловим на уровне контекста ===
+    context.on('websocket', (ws) => {
+      const rec = { url: ws.url(), frames:[], created: Date.now() };
+      ws.on('framereceived', d => rec.frames.push({dir:'in', t:Date.now(), dataType: typeof d, payload: typeof d==='string'? d : Buffer.from(d).toString('base64')}));
+      ws.on('framesent', d => rec.frames.push({dir:'out',t:Date.now(), dataType: typeof d, payload: typeof d==='string'? d : Buffer.from(d).toString('base64')}));
+      ws.on('close', async () => {
+        const out = path.join(wsDir, `${Date.now()}_${Math.random().toString(36).slice(2)}.json`);
+        await fs.writeFile(out, JSON.stringify(rec, null, 2));
+        manifest.ws.push({ url: rec.url, file: path.relative(outDir, out).replace(/\\/g,'/')});
+        counts.ws++;
+        await jlog({ ev: 'ws.saved', url: rec.url, frames: rec.frames.length });
+      });
+    });
+
     // === API: ловим на уровне контекста (включая cross-origin iframe) ===
     context.on('response', async (resp) => {
       try {
         const req = resp.request();
-        const type = req.resourceType();
-        if (type !== 'xhr' && type !== 'fetch') return;
-
         const url = resp.url();
-        const u = new URL(url);
+        const type = req.resourceType();
         const ct = (resp.headers()['content-type'] || '').toLowerCase();
+        
+        // считаем API любые XHR/fetch ИЛИ JSON не из каталога assets/renderer/build/…
+        const isX = (type==='xhr' || type==='fetch');
+        const isJson = ct.includes('application/json');
+        if (!isX && !isJson) return;
+
+        const u = new URL(url);
         const body = await resp.body().catch(() => null);
 
         // Куда сохранять
@@ -135,6 +153,14 @@ export async function capture(url, {
           url
         };
         await fs.writeFile(file + '.meta.json', JSON.stringify(meta, null, 2));
+        
+        // Добавить в manifest.api
+        manifest.api.push({
+          url: url,
+          method: req.method(),
+          status: resp.status(),
+          file: path.relative(outDir, file).replace(/\\/g,'/')
+        });
         
         // Обновляем счетчики
         counts.api++;

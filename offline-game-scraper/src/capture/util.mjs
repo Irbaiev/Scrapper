@@ -38,7 +38,8 @@ export function isProbablyApi(contentType, url, method, status){
   const pathname = u.pathname.toLowerCase();
   const isStaticJson = pathname.endsWith('.json') && (
     pathname.includes('/assets/') || pathname.includes('/renderer/') ||
-    pathname.includes('/build/')  || pathname.includes('/manifest')
+    pathname.includes('/build/')  || pathname.includes('/manifest') ||
+    pathname.includes('/locale/') || pathname.includes('/preload/')
   );
   if (isStaticJson) return false;
 

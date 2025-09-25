@@ -9,7 +9,36 @@ function parseArgs(argv){ const a={}; for(let i=2;i<argv.length;i++){ const t=ar
 const safeJson = (x)=> JSON.stringify(x, null, 2);
 const shortHash = (s)=> crypto.createHash('sha1').update(String(s)).digest('hex').slice(0,8);
 const normUrl = (u)=>{ try{ const x=new URL(u); x.hash=''; const p=[...x.searchParams.entries()].sort(([a],[b])=>a.localeCompare(b)); x.search=''; for(const [k,v] of p) x.searchParams.append(k,v); return x.toString(); }catch{ return u; } };
-const fetchNode = (url)=> new Promise((res, rej)=>{ const mod=url.startsWith('https:')?https:http; const req=mod.get(url,{rejectUnauthorized:false},r=>{const chunks=[]; r.on('data',c=>chunks.push(c)); r.on('end',()=>res({status:r.statusCode||0, headers:r.headers, body:Buffer.concat(chunks)}));}); req.on('error',rej);});
+
+// нормализация URL без «летучих» параметров
+const VOLATILE = new Set(['token','auth','_','v','ver','verId','cb','cache','t','ts','timestamp']);
+function normUrlLoose(u) {
+  try {
+    const x = new URL(u);
+    x.hash = '';
+    // сортируем и выкидываем летучие query
+    const pairs = [...x.searchParams.entries()]
+      .filter(([k]) => !VOLATILE.has(k.toLowerCase()))
+      .sort(([a],[b]) => a.localeCompare(b));
+    x.search = '';
+    for (const [k,v] of pairs) x.searchParams.append(k,v);
+    return x.toString();
+  } catch { return u; }
+}
+const fetchNode = (url, {referer}={}) => new Promise((res, rej) => {
+  const mod = url.startsWith('https:') ? https : http;
+  const req = mod.get(url, {
+    rejectUnauthorized: false,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123 Safari/537.36',
+      ...(referer ? { Referer: referer } : {})
+    }
+  }, r => {
+    const chunks=[]; r.on('data',c=>chunks.push(c));
+    r.on('end',()=>res({status:r.statusCode||0, headers:r.headers, body:Buffer.concat(chunks)}));
+  });
+  req.on('error', rej);
+});
 const mirrorRelFor = (uStr)=>{ const u=new URL(uStr); let p=u.pathname; if(p.endsWith('/')) p+='index.html'; if(u.search){ const tag='.__q_'+shortHash(u.search); const dot=p.lastIndexOf('.'); p=(dot>-1&&dot>=p.lastIndexOf('/'))? (p.slice(0,dot)+tag+p.slice(dot)) : (p+tag); } return path.posix.join('mirror', u.hostname, p.replace(/^\//,'')); };
 
 async function copyEnsure(src, dst){ await fs.mkdir(path.dirname(dst), {recursive:true}); await fs.copyFile(src, dst); }
@@ -44,10 +73,10 @@ async function main(){
   }
 
   // -------- 2) PRELOAD внешних (по HTML + CSS + loadScript)
-  const ensureMirror = async (abs) => {
+  const ensureMirror = async (abs, referer) => {
     const key = normUrl(abs); if (mirrorMap[key]) return;
     try {
-      const r = await fetchNode(abs);
+      const r = await fetchNode(abs, { referer });
       if (r.status>=200 && r.status<400) {
         const rel = mirrorRelFor(abs);
         await fs.mkdir(path.join(outDir, path.dirname(rel)), { recursive: true });
@@ -75,7 +104,7 @@ async function main(){
       while((m=re.exec(css))) extUrls.add(m[2]);
     } catch {}
   }
-  await Promise.all([...extUrls].map(ensureMirror));
+  await Promise.all([...extUrls].map(u => ensureMirror(u, manifest.url)));
 
   // -------- 3) API/WS карты
   const apiMap = [];
@@ -115,6 +144,31 @@ function log(){/* mute in prod */} // можно включить лог при 
 
 function norm(u){try{const x=new URL(u);x.hash='';const a=[...x.searchParams.entries()].sort(([p],[q])=>p.localeCompare(q));x.search='';for(const [k,v] of a)x.searchParams.append(k,v);return x.toString();}catch{return u}}
 
+// нормализация URL без «летучих» параметров
+const VOLATILE = new Set(['token','auth','_','v','ver','cb','cache','t','ts','timestamp']);
+function normLoose(u){ try{
+  const x=new URL(u); x.hash='';
+  const pairs=[...x.searchParams.entries()]
+    .filter(([k])=>!VOLATILE.has(k.toLowerCase()))
+    .sort(([a],[b])=>a.localeCompare(b));
+  x.search=''; for(const [k,v] of pairs) x.searchParams.append(k,v);
+  return x.toString();
+}catch{return u}}
+
+// заглушки для аналитики сразу:
+const text200 = (t,ctype='application/javascript') =>
+  new Response(t,{status:200,headers:{'content-type':ctype}});
+
+// CORS/OPTIONS preflight:
+function cors204(origin='*'){
+  return new Response(null,{status:204,headers:{
+    'access-control-allow-origin': origin,
+    'access-control-allow-credentials': 'true',
+    'access-control-allow-headers': '*,content-type,authorization',
+    'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+  }});
+}
+
 let API_MAP=null; async function getApi(){ if(API_MAP) return API_MAP; const r=await fetch(BASE+API_MAP_PATH).catch(()=>null); API_MAP=r? await r.json(): []; return API_MAP; }
 
 self.addEventListener('install', e=>{
@@ -128,46 +182,58 @@ self.addEventListener('install', e=>{
 self.addEventListener('activate', e=>{ e.waitUntil(self.clients.claim()); });
 
 self.addEventListener('fetch', (event)=>{
-  const req=event.request;
-  const urlStr=req.url;
-  const u=new URL(urlStr);
+  const req = event.request;
+  const urlStr = req.url;
+  const u = new URL(urlStr);
 
-  // игнор внутренних схем
+  // игнор расширений/девтулз
   if (u.protocol==='chrome-extension:' || u.protocol==='devtools:') return;
 
   event.respondWith((async()=>{
-    // аналитика — глушим
-    if (u.hostname==='www.googletagmanager.com' || u.hostname==='static.cloudflareinsights.com')
-      return new Response('/* offline noop */',{status:200,headers:{'content-type':'application/javascript'}});
+    // preflight
+    if (req.method === 'OPTIONS') return cors204(req.headers.get('origin')||'*');
 
-    // ассеты из карты
-    const key=norm(urlStr);
-    const assetRel=ASSET_MAP[key];
-    if (assetRel){
+    // аналитика → заглушка
+    if (u.hostname==='www.googletagmanager.com' || u.hostname==='static.cloudflareinsights.com')
+      return text200('/* offline noop */');
+
+    if (u.hostname==='region1.analytics.google.com' || u.hostname==='stats.g.doubleclick.net')
+      return text200('ok');
+
+    // API карта: точное и «loose» совпадение
+    try{
+      const map = await getApi();
+      const method = req.method.toUpperCase();
+      const kExact = map.find(x=> x.method===method && x.url===norm(urlStr));
+      const kLoose = map.find(x=> x.method===method && x.url===normLoose(urlStr));
+      const k = kExact || kLoose;
+      if (k){
+        const data=await fetch(BASE + k.file);
+        const rec=await data.json();
+        const hdr = new Headers(rec.response?.headers || { 'content-type': k.contentType || 'application/json' });
+        hdr.set('access-control-allow-origin','*');
+        hdr.set('access-control-allow-credentials','true');
+        const b64=rec.response?.bodyB64;
+        const body=b64? Uint8Array.from(atob(b64), c=>c.charCodeAt(0)) : null;
+        return new Response(body, { status: rec.response?.status||200, headers: hdr });
+      }
+    } catch {}
+
+    // ассеты из карты (кэш)
+    const exact = ASSET_MAP[norm(urlStr)] || ASSET_MAP[normLoose(urlStr)];
+    if (exact){
       const cache=await caches.open(ASSETS_CACHE);
-      const hit=await cache.match(BASE+assetRel);
+      const hit=await cache.match(BASE + exact);
       if (hit) return hit;
-      try{ const res=await fetch(BASE+assetRel); if(res.ok){ await cache.put(BASE+assetRel,res.clone()); return res; } }catch{}
+      try {
+        const r = await fetch(BASE + exact);
+        if (r.ok) { await cache.put(BASE + exact, r.clone()); return r; }
+      } catch {}
       return new Response(null,{status:404});
     }
 
-    // API — из моков
-    try{
-      const map=await getApi();
-      const method=req.method.toUpperCase();
-      const mm = map.find(x=> x.method===method && x.url===norm(urlStr));
-      if (mm){
-        const data=await fetch(BASE+mm.file);
-        const rec=await data.json();
-        const b64=rec.response?.bodyB64;
-        const body=b64? Uint8Array.from(atob(b64), c=>c.charCodeAt(0)) : null;
-        const hdr=rec.response?.headers || {'content-type': mm.contentType};
-        return new Response(body, { status: rec.response?.status||200, headers: hdr });
-      }
-    }catch(e){}
-
-    // всё остальное — пусть идёт как есть (или 204 оффлайн)
-    try{ return await fetch(req); } catch { return new Response(null,{status:204}); }
+    // попытка «как есть» (онлайн) → если оффлайн — 204
+    try { return await fetch(req); } catch { return new Response(null,{status:204}); }
   })());
 });`;
   await fs.writeFile(path.join(outDir,'sw.js'), sw);
@@ -209,7 +275,7 @@ self.addEventListener('fetch', (event)=>{
   window.fetch = async function(input, init){
     try{
       const url = typeof input==='string'? input : (input?.url||'');
-      if(/^https?:\\/\\//i.test(url)){
+      if(/^https?:\/\//i.test(url)){
         const local = (await getMirror())[norm(url)];
         if(local && (init?.method||'GET').toUpperCase()==='GET'){ return origFetch(BASE+local, init); }
       }
@@ -220,7 +286,7 @@ self.addEventListener('fetch', (event)=>{
   const origOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url, ...rest){
     try{
-      if(/^https?:\\/\\//i.test(url)){
+      if(/^https?:\/\//i.test(url)){
         getMirror().then(m=>{
           const n=norm(url); const local=m[n];
           if(local && String(method||'GET').toUpperCase()==='GET'){
@@ -232,6 +298,89 @@ self.addEventListener('fetch', (event)=>{
     } catch {}
     return origOpen.call(this, method, url, ...rest);
   };
+
+  // помощь: взять локальный путь из mirror
+  async function toLocalIfMirror(u) {
+    try {
+      const m = await getMirror();
+      const key = norm(u);
+      return m[key] ? BASE + m[key] : null;
+    } catch { return null; }
+  }
+
+  // 1) перехват динамических скриптов/стилей
+  (function patchDynamicAssets(){
+    const origCreate = document.createElement;
+    document.createElement = function(tag){
+      const el = origCreate.call(document, tag);
+      if (tag.toLowerCase() === 'script') {
+        const d = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
+        if (d && d.set) {
+          Object.defineProperty(el, 'src', {
+            set(v){
+              const setSrc = async () => {
+                const local = /^https?:\/\//i.test(v) ? await toLocalIfMirror(v) : null;
+                d.set.call(el, local || v);
+              };
+              setSrc();
+            },
+            get(){ return d.get.call(el); }
+          });
+        }
+      }
+      if (tag.toLowerCase() === 'link') {
+        const d = Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype, 'href');
+        if (d && d.set) {
+          Object.defineProperty(el, 'href', {
+            set(v){
+              const setHref = async () => {
+                const local = /^https?:\/\//i.test(v) ? await toLocalIfMirror(v) : null;
+                d.set.call(el, local || v);
+              };
+              setHref();
+            },
+            get(){ return d.get.call(el); }
+          });
+        }
+      }
+      return el;
+    };
+
+    // глобальный loadScript(fn) если есть
+    if (typeof window.loadScript === 'function' && !window.__patchedLoadScript) {
+      const orig = window.loadScript;
+      window.loadScript = async function(u, cb){
+        try {
+          const local = /^https?:\/\//i.test(u) ? await toLocalIfMirror(u) : null;
+          return orig.call(this, local || u, cb);
+        } catch { return orig.apply(this, arguments); }
+      };
+      window.__patchedLoadScript = true;
+    }
+  })();
+
+  // VERY BASIC WS MOCK (only keeps client happy). Disable if real ws mocks added.
+  (function basicWsMock(){
+    if (!window.__enableBasicWsMock) return; // включай вручную при надобности
+    const NativeWS = window.WebSocket;
+    window.WebSocket = class extends NativeWS {
+      constructor(url, protocols){
+        // рвём исходное соединение и делаем «локальный»
+        super('ws://invalid.local/', protocols);
+        setTimeout(()=> this.dispatchEvent(new Event('open')), 10);
+
+        // пинг/понг: если клиент шлёт "ping" (текст) — отвечаем "pong"
+        this.addEventListener('message', (e)=>{
+          if (typeof e.data === 'string' && /ping/i.test(e.data)) {
+            setTimeout(()=> this.dispatchEvent(new MessageEvent('message', { data: 'pong' })), 50);
+          }
+        });
+
+        // закрытие по навигации
+        window.addEventListener('beforeunload', ()=> this.close());
+      }
+    };
+  })();
 })();`;
   await fs.writeFile(path.join(outDir,'runtime','offline.js'), rt);
 
@@ -252,6 +401,22 @@ self.addEventListener('fetch', (event)=>{
   replAttr('script','src');
   replAttr('link','href');
   replAttr('img','src');
+  replAttr('img','srcset');
+  replAttr('source','src');
+  replAttr('video','poster');
+  replAttr('iframe','src');
+  replAttr('use','href'); // <use href="…"> (и xlink:href, если нужно)
+  outHtml = outHtml.replace(/\s+xlink:href=(["'`])(https?:\/\/[^"'`]+)\1/gi,
+    (m,q,abs)=> { const local = mirrorMap[normUrl(abs)]; return local ? m.replace(abs, local) : m; });
+
+  // inline style url(...)
+  outHtml = outHtml.replace(/url\((['"]?)(https?:\/\/[^'")]+)\1\)/gi,
+    (m,q,abs)=> { const local = mirrorMap[normUrl(abs)]; return local ? m.replace(abs, local) : m; });
+
+  // простое @import 'https://…'
+  outHtml = outHtml.replace(/@import\s+(?:url\()?(['"])(https?:\/\/[^'"]+)\1\)?/gi,
+    (m,q,abs)=> { const local = mirrorMap[normUrl(abs)]; return local ? m.replace(abs, local) : m; });
+
   // loadScript('https://…') → mirror/…
   outHtml = outHtml.replace(/loadScript\((["'`])(https?:\/\/[^"'`]+)\1\)/gi, (m,q,abs)=>{
     const local = mirrorMap[normUrl(abs)];

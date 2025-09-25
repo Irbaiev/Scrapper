@@ -1,0 +1,16 @@
+{
+  "name": "offline-game-scraper",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "scrape": "node bin/scrape.mjs",
+    "build": "node bin/build.mjs",
+    "serve": "node bin/serve.mjs",
+    "enhance": "node bin/enhance.mjs",
+    "validate": "node bin/validate.mjs"
+  },
+  "dependencies": {
+    "mime-types": "^2.1.35",
+    "playwright": "^1.45.0"
+  }
+}

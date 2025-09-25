@@ -2,186 +2,265 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import { chromium } from 'playwright';
 import { sha256, ensureDir, safeJson, isProbablyApi, pickExt, writeFileIfChanged, nowTs } from './util.mjs';
+import { autoInteract } from './interact.mjs';
 
-export async function capture(url, { outDir, harvestMs = 12000, headless = true } = {}) {
+export async function capture(url, {
+  outDir,
+  harvestMs = 60000,
+  headless = true,
+  scenario = 'default',       // default | legacy | mobile | all
+  interact = 'auto',         // auto | off
+  loadAll = false            // принудительно догружать fallback-скрипты
+} = {}) {
+
+  // ==== подготовка папок + лог ====
   const storageDir = path.join(outDir, 'storage');
   const assetsDir = path.join(storageDir, 'assets');
   const apiDir = path.join(storageDir, 'api');
   const wsDir = path.join(storageDir, 'ws');
-  await ensureDir(assetsDir);
-  await ensureDir(apiDir);
-  await ensureDir(wsDir);
-
-  const manifest = {
-    createdAt: nowTs(),
-    url,
-    assets: {},        // absUrl -> { path, sha256, size, status, headers, contentType }
-    api: [],           // массив { request, response }
-    ws: [],            // массив { url, frames: [...], closed: true, closeCode?, closeReason? }
-    errors: [],
+  const logsDir = path.join(outDir, 'logs');
+  await ensureDir(assetsDir); await ensureDir(apiDir); await ensureDir(wsDir); await ensureDir(logsDir);
+  const logPath = path.join(logsDir, `capture-${Date.now()}.ndjson`);
+  const jlog = async (obj) => {
+    try { await fs.appendFile(logPath, JSON.stringify({ t: Date.now(), ...obj }) + '\n'); } catch {}
   };
 
-  let counts = { assets: 0, api: 0, ws: 0 };
+  const manifest = { createdAt: nowTs(), url, assets: {}, api: [], ws: [], errors: [] };
+  const counts = { assets: 0, api: 0, ws: 0, errors: 0 };
 
-  const browser = await chromium.launch({ headless });
-  const context = await browser.newContext({
-    acceptDownloads: true,
-    ignoreHTTPSErrors: true,
-    // эмулируем типичный десктоп
-    viewport: { width: 1600, height: 900 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-    javaScriptEnabled: true,
-  });
+  const scenarios = (scenario === 'all') ? ['default', 'legacy', 'mobile'] : [scenario];
 
-  // CDP для WebSocket - включаем ДО создания страницы
-  const page = await context.newPage();
-  const client = await context.newCDPSession(page);
-  await client.send('Network.enable');
-  await client.send('Page.enable');
-
-  const wsById = new Map();
-  client.on('Network.webSocketCreated', (e) => {
-    console.log('[capture] WebSocket created:', e.url);
-    wsById.set(e.requestId, { url: e.url, frames: [], created: Date.now() });
-  });
-  client.on('Network.webSocketFrameSent', (e) => {
-    const entry = wsById.get(e.requestId);
-    if (entry) entry.frames.push({ dir: 'out', t: Date.now(), payload: e.response.payloadData, opcode: e.response.opcode });
-  });
-  client.on('Network.webSocketFrameReceived', (e) => {
-    const entry = wsById.get(e.requestId);
-    if (entry) entry.frames.push({ dir: 'in', t: Date.now(), payload: e.response.payloadData, opcode: e.response.opcode });
-  });
-  client.on('Network.webSocketClosed', (e) => {
-    const entry = wsById.get(e.requestId);
-    if (entry) entry.closed = true;
-  });
-
-  const pendingResponses = new Set();
-
-  page.on('response', async (resp) => {
+  // helper: сделать из ES6 пути fallback-путь
+  function deriveFallback(u) {
     try {
+      const x = new URL(u);
+      x.pathname = x.pathname.replace(/\/es6\//i, '/').replace(/\.es6(\.[a-z]+)$/i, '$1');
+      return x.toString();
+    } catch { return u; }
+  }
+
+  // ==== цикл по сценариям ====
+  for (const sc of scenarios) {
+    await jlog({ phase: 'scenario.start', sc });
+
+    // харденинг против антибота + стабильное закрытие
+    const browser = await chromium.launch({
+      headless,
+      args: ['--disable-blink-features=AutomationControlled'],
+    });
+    const context = await browser.newContext({
+      acceptDownloads: true,
+      ignoreHTTPSErrors: true,
+      viewport: sc === 'mobile' ? { width: 390, height: 780 } : { width: 1600, height: 900 },
+      userAgent: sc === 'mobile'
+        ? 'Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36'
+        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+      javaScriptEnabled: true,
+    });
+
+    // убираем navigator.webdriver
+    await context.addInitScript(() => {
+      try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch {}
+    });
+
+    // Legacy: насильно включаем fallback-бандлы
+    if (sc === 'legacy') {
+      await context.addInitScript(() => {
+        try { window.browserSupportsAllFeatures = () => false; } catch {}
+        try { Object.defineProperty(window, 'SharedArrayBuffer', { get(){ return undefined; } }); } catch {}
+      });
+    }
+
+    const page = await context.newPage();
+
+    // ===== WS: ловим на всём контексте (включая cross-origin iframes) =====
+    const wsRecs = [];
+    const wsHandler = (ws) => {
+      const rec = { url: ws.url(), frames: [], created: Date.now(), scenario: sc };
+      ws.on('framereceived', (data) => {
+        rec.frames.push({ dir: 'in', t: Date.now(), payload: typeof data === 'string' ? data : data.toString('base64'), opcode: typeof data === 'string' ? 1 : 2 });
+      });
+      ws.on('framesent', (data) => {
+        rec.frames.push({ dir: 'out', t: Date.now(), payload: typeof data === 'string' ? data : data.toString('base64'), opcode: typeof data === 'string' ? 1 : 2 });
+      });
+      ws.on('close', () => { rec.closed = true; });
+      wsRecs.push(rec);
+    };
+    context.on('websocket', wsHandler);
+
+    // ===== сетевые ответы =====
+    const failed = [];
+    page.on('requestfailed', (req) => {
+      failed.push({ url: req.url(), method: req.method(), failure: req.failure()?.errorText || 'failed' });
+      jlog({ type: 'requestfailed', url: req.url(), method: req.method(), err: req.failure()?.errorText });
+    });
+
+    page.on('response', async (resp) => {
       const req = resp.request();
       const method = req.method();
       const absUrl = req.url();
-      const status = resp.status();
-      const headers = resp.headers();
-      const contentType = headers['content-type'] || headers['Content-Type'] || '';
+      try {
+        const status = resp.status();
+        const headers = resp.headers();
+        const contentType = headers['content-type'] || headers['Content-Type'] || '';
+        if (/^(data:|chrome-extension:)/i.test(absUrl)) return;
 
-      // игнорируем data: и chrome-extension:
-      if (/^(data:|chrome-extension:)/i.test(absUrl)) return;
+        // финализируем тело (без зависаний)
+        let body;
+        try { body = await resp.body(); } catch { body = Buffer.alloc(0); }
 
-      // ждём завершения
-      pendingResponses.add(resp);
-      await resp.finished();
+        // API
+        if (isProbablyApi(contentType, absUrl, method, status)) {
+          const reqBody = await req.postDataBuffer().catch(() => null);
+          const record = {
+            time: nowTs(),
+            request: { method, url: absUrl, headers: req.headers(), bodyB64: reqBody ? Buffer.from(reqBody).toString('base64') : null },
+            response: { status, headers, contentType, bodyB64: Buffer.from(body).toString('base64') }
+          };
+          const fname = path.join(apiDir, `${Date.now()}_${Math.random().toString(36).slice(2)}.json`);
+          await fs.writeFile(fname, safeJson(record));
+          manifest.api.push({ file: path.relative(outDir, fname).replace(/\\/g, '/'), url: absUrl, method, status });
+          counts.api++;
+          await jlog({ type: 'api.saved', url: absUrl, method, status, file: fname });
+          return; // ВАЖНО: без удаления из какого-либо pending (мы его больше не ведём)
+        }
 
-      let body;
-      try { body = await resp.body(); } catch { body = Buffer.alloc(0); }
-
-      // сохраняем API отдельно (для будущих моков)
-      if (isProbablyApi(contentType, absUrl, method, status)) {
-        console.log('[capture] API detected:', method, absUrl, status);
-        const reqBody = await req.postDataBuffer().catch(() => null);
-        const record = {
-          time: nowTs(),
-          request: { method, url: absUrl, headers: req.headers(), bodyB64: reqBody ? Buffer.from(reqBody).toString('base64') : null },
-          response: { status, headers, contentType, bodyB64: Buffer.from(body).toString('base64') }
-        };
-        const fname = path.join(apiDir, `${Date.now()}_${Math.random().toString(36).slice(2)}.json`);
-        await fs.writeFile(fname, safeJson(record));
-        manifest.api.push({ file: path.relative(outDir, fname), url: absUrl, method, status });
-        counts.api++;
-        console.log('[capture] API saved:', counts.api);
-        pendingResponses.delete(resp);
-        return;
+        // ассеты
+        const hash = sha256(body);
+        const ext = pickExt(absUrl, contentType);
+        const rel = path.join('storage', 'assets', `${hash}.${ext}`);
+        const filepath = path.join(outDir, rel);
+        await writeFileIfChanged(filepath, body);
+        if (!manifest.assets[absUrl]) {
+          manifest.assets[absUrl] = {
+            path: rel.replace(/\\/g, '/'),
+            sha256: hash,
+            size: body.length,
+            status,
+            headers,
+            contentType
+          };
+          counts.assets++;
+        }
+      } catch (e) {
+        manifest.errors.push({ type: 'response', url: absUrl, message: String(e) }); counts.errors++;
+        await jlog({ type: 'error.response', url: absUrl, error: String(e) });
       }
+    });
 
-      // сохраняем ассет
-      const hash = sha256(body);
-      const ext = pickExt(absUrl, contentType);
-      const rel = path.join('storage', 'assets', `${hash}.${ext}`);
-      const filepath = path.join(outDir, rel);
-      await writeFileIfChanged(filepath, body);
-
-      manifest.assets[absUrl] = {
-        path: rel.replace(/\\/g, '/'),
-        sha256: hash,
-        size: body.length,
-        status,
-        headers,
-        contentType
-      };
-      counts.assets++;
-    } catch (e) {
-      manifest.errors.push({ type: 'response', message: String(e) });
-    } finally {
-      pendingResponses.delete(resp);
-    }
-  });
-
-  // Загружаем страницу и ждём активность
-  console.log('[capture] Loading page:', url);
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  
-  // Обрабатываем все iframe для WebSocket'ов
-  const frames = page.frames();
-  console.log('[capture] Found', frames.length, 'frames');
-  for (let i = 0; i < frames.length; i++) {
-    const frame = frames[i];
+    // ===== навигация с жёсткими таймаутами =====
+    await jlog({ phase: 'goto', url });
     try {
-      console.log('[capture] Frame', i, 'URL:', frame.url());
-      // CDP уже включен для основной страницы, WebSocket'ы должны детектироваться
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } catch (e) {
-      console.log('[capture] Frame error:', e.message);
+      await jlog({ phase: 'goto.error', error: String(e) });
     }
+    try { await page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
+
+    // ===== авто-интерактивность для запуска WS/API =====
+    if (interact === 'auto') {
+      try { await autoInteract(page); } catch {}
+    }
+
+    // ===== принудительная догрузка fallback-бандлов =====
+    if (loadAll) {
+      try {
+        await page.evaluate(() => {
+          const load = (u) => new Promise(res => {
+            const s = document.createElement('script');
+            s.src = u; s.async = true; s.onload = s.onerror = () => res();
+            document.head.appendChild(s);
+          });
+          const deriveFallback = (u) => {
+            try { const x = new URL(u, location.href);
+              x.pathname = x.pathname.replace(/\/es6\//i, '/').replace(/\.es6(\.[a-z]+)$/i, '$1');
+              return x.toString();
+            } catch { return u; }
+          };
+          const tasks = [];
+          document.querySelectorAll('script[src]').forEach(scr => {
+            const src = scr.getAttribute('src');
+            if (/\/es6\/.+\.es6\.js(\?|#|$)/i.test(src)) {
+              const fb = deriveFallback(src);
+              if (fb !== src) tasks.push(load(fb));
+            }
+          });
+          // патчим loadScript если есть
+          if (typeof window.loadScript === 'function' && !window.__patchedLoadScript) {
+            const orig = window.loadScript;
+            window.loadScript = function(u, cb) {
+              try {
+                const fb = deriveFallback(u);
+                if (fb !== u) return orig.call(window, u, () => orig.call(window, fb, cb));
+              } catch {}
+              return orig.apply(window, arguments);
+            };
+            window.__patchedLoadScript = true;
+          }
+          return Promise.allSettled(tasks);
+        });
+      } catch {}
+    }
+
+    // ===== жёсткий watchdog, чтобы точно закрыть браузер =====
+    await jlog({ phase: 'harvest.start', ms: harvestMs });
+    const watchdog = new Promise(res => setTimeout(res, harvestMs));
+    await watchdog; // гарантированно ждём
+
+    // ===== ретраи неуспешных GET (в обход CORS) =====
+    for (const f of failed) {
+      if (f.method !== 'GET') continue;
+      try {
+        const r1 = await context.request.get(f.url, { timeout: 15000 });
+        if (r1.ok()) {
+          const buf = Buffer.from(await r1.body());
+          const ct = r1.headers()['content-type'] || '';
+          const hash = sha256(buf);
+          const ext = pickExt(f.url, ct);
+          const rel = path.join('storage', 'assets', `${hash}.${ext}`);
+          await writeFileIfChanged(path.join(outDir, rel), buf);
+          if (!manifest.assets[f.url]) {
+            manifest.assets[f.url] = {
+              path: rel.replace(/\\/g, '/'),
+              sha256: hash,
+              size: buf.length,
+              status: r1.status(),
+              headers: r1.headers(),
+              contentType: ct
+            };
+            counts.assets++;
+          }
+          await jlog({ type: 'retry.saved', url: f.url, status: r1.status() });
+        } else {
+          await jlog({ type: 'retry.fail', url: f.url, status: r1.status() });
+        }
+      } catch (e) {
+        manifest.errors.push({ type: 'retry', url: f.url, error: String(e) }); counts.errors++;
+        await jlog({ type: 'retry.error', url: f.url, error: String(e) });
+      }
+    }
+
+    // ===== сохранение WS дампов из всего контекста =====
+    let idx = 0;
+    for (const rec of wsRecs) {
+      const fname = path.join(wsDir, `${Date.now()}_${sc}_${++idx}.json`);
+      await fs.writeFile(fname, safeJson(rec));
+      manifest.ws.push({ file: path.relative(outDir, fname).replace(/\\/g, '/'), url: rec.url });
+      counts.ws++;
+    }
+    await jlog({ phase: 'scenario.end', sc, ws: wsRecs.length });
+
+    // ===== чистое закрытие =====
+    try { await context.close(); } catch {}
+    try { await browser.close(); } catch {}
   }
-  
-  // подождём первичную сеть/рендер
-  console.log('[capture] Waiting for network idle...');
-  try { await page.waitForLoadState('networkidle', { timeout: 10000 }); } catch {}
-  
-  console.log('[capture] Harvesting for', harvestMs, 'ms...');
-  // затем даём игре «пожить» и послать всё что хочет
+
+  // ===== запись манифеста ВСЕГДА (даже при ошибках выше) =====
   try {
-    await Promise.race([
-      page.waitForTimeout(harvestMs),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Harvest timeout')), harvestMs + 5000))
-    ]);
+    await fs.writeFile(path.join(outDir, 'manifest.json'), safeJson(manifest));
+    await jlog({ phase: 'manifest.saved', counts });
   } catch (e) {
-    console.log('[capture] Harvest interrupted:', e.message);
-  }
-
-  // дождаться всех pending
-  if (pendingResponses.size) {
-    await Promise.allSettled([...pendingResponses].map(r => r.finished().catch(() => {})));
-  }
-
-  // Сохраняем WebSocket дампы
-  let wsCount = 0;
-  for (const entry of wsById.values()) {
-    const fname = path.join(wsDir, `${++wsCount}_${Date.now()}.json`);
-    await fs.writeFile(fname, safeJson({ url: entry.url, created: entry.created, frames: entry.frames, closed: !!entry.closed }));
-    manifest.ws.push({ file: path.relative(outDir, fname), url: entry.url });
-  }
-  counts.ws = wsCount;
-
-  // Финальный дамп манифеста
-  console.log('[capture] Saving manifest...');
-  await fs.writeFile(path.join(outDir, 'manifest.json'), safeJson(manifest));
-  console.log('[capture] Done!');
-
-  // await context.close();
-  // await browser.close();
-
-  try { 
-    await context.close(); 
-  } catch (e) {
-    console.log('[capture] Context close error:', e.message);
-  }
-  try { 
-    await browser.close(); 
-  } catch (e) {
-    console.log('[capture] Browser close error:', e.message);
+    await jlog({ phase: 'manifest.error', error: String(e) });
   }
 
   return { counts, outDir };

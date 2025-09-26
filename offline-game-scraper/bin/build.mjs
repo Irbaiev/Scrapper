@@ -34,8 +34,122 @@ async function main(){
   const doRewrite = true; // всегда делаем rewrite
   const doPrefetch = true; // всегда докачиваем внешние
 
+  console.log('[build] args:', args);
+  console.log('[build] capDir:', capDir);
+  console.log('[build] outDir:', outDir);
+
   const manifest = JSON.parse(await fs.readFile(path.join(capDir,'manifest.json'),'utf8'));
   await fs.mkdir(outDir, { recursive: true });
+
+  // -------- A) Автоподхват WS файлов, если manifest.ws пуст или частичный
+  async function autoDiscoverWs(captureDir, manifest) {
+    const wsRoot = path.join(captureDir, 'ws');
+    let entries = [];
+    try {
+      async function walk(dir) {
+        const items = await fs.readdir(dir, { withFileTypes: true });
+        for (const it of items) {
+          const p = path.join(dir, it.name);
+          if (it.isDirectory()) await walk(p);
+          else if (it.isFile() && /\.ndjson$/.test(it.name)) entries.push(p);
+        }
+      }
+      await walk(wsRoot);
+    } catch { /* no ws dir */ }
+
+    // уже есть записи?
+    const existing = new Set((manifest.ws||[]).map(x => path.normalize(x.file)));
+    for (const full of entries) {
+      const rel = path.relative(captureDir, full).replace(/\\/g,'/');
+      if (existing.has(rel)) continue;
+
+      // url восстанавливаем из пути к файлу (ws.host.com/connect/token/...)
+      let url = '';
+      try {
+        // Извлекаем URL из пути: ws.host.com/connect/token/...
+        const pathParts = full.split(path.sep);
+        const wsIndex = pathParts.findIndex(p => p.startsWith('ws.'));
+        if (wsIndex !== -1 && wsIndex + 1 < pathParts.length) {
+          const host = pathParts[wsIndex];
+          const endpoint = pathParts[wsIndex + 1];
+          url = `wss://${host}/${endpoint}`;
+        }
+      } catch {}
+      if (!url) continue;
+      manifest.ws = manifest.ws || [];
+      manifest.ws.push({ url, file: rel });
+    }
+  }
+
+  await autoDiscoverWs(capDir, manifest);
+  console.log('[build] WS files found:', (manifest.ws||[]).length);
+
+  // -------- B) Автосинхронизация токенов
+  function extractTokenFromConnectRec(recJson) {
+    try {
+      const rec = JSON.parse(recJson);
+      if (rec.response?.bodyB64) {
+        const body = Buffer.from(rec.response.bodyB64, 'base64').toString('utf8');
+        const parsed = JSON.parse(body);
+        return parsed.token || parsed.url?.match(/token=([^&]+)/)?.[1];
+      }
+    } catch {}
+    return null;
+  }
+
+  async function harmonizeTokens({ capDir, outDir, assetMap, apiMapPath, mirrorPath }) {
+    // Ищем API файлы с токенами в директории storage/api
+    const apiDir = path.join(capDir, 'storage', 'api');
+    let token = null;
+    let connectFile = null;
+    
+    console.log('[harmonizeTokens] Searching for tokens in:', apiDir);
+    
+    try {
+      const apiFiles = await fs.readdir(apiDir);
+      console.log('[harmonizeTokens] Found API files:', apiFiles.length);
+      
+      for (const file of apiFiles) {
+        if (!file.endsWith('.json')) continue;
+        const filePath = path.join(apiDir, file);
+        const content = await fs.readFile(filePath, 'utf8');
+        const rec = JSON.parse(content);
+        
+        if (rec.request?.url && /\/connect.*token=/i.test(rec.request.url)) {
+          console.log('[harmonizeTokens] Found connect API:', rec.request.url);
+          token = extractTokenFromConnectRec(content);
+          if (token) {
+            connectFile = file;
+            console.log('[harmonizeTokens] Extracted token:', token);
+            break;
+          }
+        }
+      }
+    } catch (err) {
+      console.error('[harmonizeTokens] Error:', err.message);
+    }
+
+    if (!token) {
+      console.log('[harmonizeTokens] No token found');
+      return;
+    }
+
+    // обновляем platformConfig.json
+    const platformConfigPath = path.join(outDir, 'mirror', 'staging.playzia.com', 'casino', 'configuration', 'platformConfig.json');
+    try {
+      const config = JSON.parse(await fs.readFile(platformConfigPath, 'utf8'));
+      config.token = token;
+      await fs.writeFile(platformConfigPath, JSON.stringify(config, null, 2));
+    } catch {}
+
+    // обновляем apiMap.json
+    const apiMap = JSON.parse(await fs.readFile(path.join(outDir, apiMapPath), 'utf8'));
+    const connectEntry = apiMap.find(e => /\/connect/i.test(e.url));
+    if (connectEntry) {
+      connectEntry.url = connectEntry.url.replace(/token=[^&]+/, `token=${token}`);
+    }
+    await fs.writeFile(path.join(outDir, apiMapPath), JSON.stringify(apiMap, null, 2));
+  }
 
   const assetsOut = path.join(outDir,'assets');
   const mocksApiOut = path.join(outDir,'mocks','api');
@@ -149,6 +263,107 @@ async function main(){
   }
   await fs.writeFile(path.join(outDir,'mocks','apiMap.json'), JSON.stringify(apiMap,null,2));
 
+  // -------- B) Автосинхронизация токенов (connect → platformConfig → карты)
+  function extractTokenFromConnectRec(recJson) {
+    try {
+      const r = JSON.parse(recJson);
+      // 1) классика: { token: "uuid" }
+      if (r.response) {
+        const body = r.response.bodyB64 ? Buffer.from(r.response.bodyB64, 'base64').toString('utf8') : '';
+        const json = JSON.parse(body || '{}');
+        if (json.token && typeof json.token === 'string') return json.token;
+      }
+    } catch {}
+    return null;
+  }
+
+  async function harmonizeTokens({ capDir, outDir, assetMap, apiMapPath, mirrorPath }) {
+    console.log('[harmonizeTokens] Starting token harmonization');
+    
+    // найдём первый connect-мок
+    const apiMapFull = path.join(outDir, apiMapPath);
+    let apiMap = [];
+    try { 
+      apiMap = JSON.parse(await fs.readFile(apiMapFull, 'utf8'));
+      console.log('[harmonizeTokens] Loaded API map with', apiMap.length, 'entries');
+    } catch (err) {
+      console.error('[harmonizeTokens] Error loading API map:', err.message);
+    }
+
+    let token = null;
+    for (const m of apiMap) {
+      console.log('[harmonizeTokens] Checking API:', m.url);
+      if (!/\/connect/i.test(m.url)) continue;
+      console.log('[harmonizeTokens] Found connect API:', m.url);
+      try {
+        const rec = await fs.readFile(path.join(outDir, m.file), 'utf8');
+        token = extractTokenFromConnectRec(rec);
+        if (token) {
+          console.log('[harmonizeTokens] Extracted token:', token);
+          break;
+        }
+      } catch (err) {
+        console.error('[harmonizeTokens] Error reading connect file:', err.message);
+      }
+    }
+    if (!token) {
+      console.log('[harmonizeTokens] No token found');
+      return; // нет — ничего не делаем
+    }
+
+    const TOKEN_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/ig;
+
+    // 1) подменим токен в JSON-ассетах конфигов (в assetMap ищем platform/configuration/*.json)
+    for (const [abs, rel] of Object.entries(assetMap)) {
+      if (!/configuration|platform|config/i.test(abs) || !/\.json(\?|$)/i.test(abs)) continue;
+      const p = path.join(outDir, rel);
+      try {
+        const s = await fs.readFile(p, 'utf8');
+        const s2 = s.replace(TOKEN_RE, token);
+        if (s2 !== s) await fs.writeFile(p, s2);
+      } catch {}
+    }
+
+    // 2) подменим токен в api-моках (тела и url)
+    for (const m of apiMap) {
+      try {
+        const full = path.join(outDir, m.file);
+        const s = await fs.readFile(full, 'utf8');
+        const s2 = s.replace(TOKEN_RE, token);
+        if (s2 !== s) await fs.writeFile(full, s2);
+        // url в карте — если был query token
+        const u = new URL(m.url);
+        if (u.searchParams.has('token')) {
+          u.searchParams.set('token', token);
+          m.url = u.toString();
+        }
+      } catch {}
+    }
+    await fs.writeFile(apiMapFull, JSON.stringify(apiMap, null, 2));
+
+    // 3) поправим mirrorIndex — ключи без «летучих» параметров, поэтому чаще всего не нужно,
+    // но на всякий случай: если встречается токен в значениях — заменим.
+    try {
+      const mp = JSON.parse(await fs.readFile(path.join(outDir, mirrorPath), 'utf8'));
+      let changed = false;
+      for (const k of Object.keys(mp)) {
+        const v = mp[k];
+        if (TOKEN_RE.test(v)) {
+          mp[k] = v.replace(TOKEN_RE, token); changed = true;
+        }
+      }
+      if (changed) await fs.writeFile(path.join(outDir, mirrorPath), JSON.stringify(mp, null, 2));
+    } catch {}
+  }
+
+  await harmonizeTokens({
+    capDir,
+    outDir,
+    assetMap,                // объект abs->rel
+    apiMapPath: 'mocks/apiMap.json',
+    mirrorPath: 'mirrorIndex.json'
+  });
+
   // WS map
   const wsMap = [];
   for (const e of (manifest.ws||[])) {
@@ -162,11 +377,12 @@ async function main(){
   await fs.writeFile(path.join(outDir,'mirrorIndex.json'), safeJson(mirrorMap));
 
   // -------- 5) SW (работает из ЛЮБОЙ подпапки)
+  const BUILD_TAG = Date.now().toString(); // или sha1(manifest)
   const sw = `/* auto-gen */
-const ASSET_MAP = ${JSON.stringify(assetMap)};
+const ASSET_MAP = ${JSON.stringify(mirrorMap)};
 const API_MAP_PATH = 'mocks/apiMap.json';
 const BASE = new URL(self.registration.scope).pathname.replace(/[^/]+$/, '');
-const ASSETS_CACHE = 'offline-assets-v3';
+const ASSETS_CACHE = 'offline-assets-v4-${BUILD_TAG}';
 
 // нормализации
 const VOLATILE = new Set(['token','auth','_','v','ver','verid','cb','cache','t','ts','timestamp']);
@@ -382,6 +598,9 @@ self.addEventListener('fetch', (event)=>{
 
   await fs.writeFile(path.join(outDir,'index.html'), outHtml);
   await fs.writeFile(path.join(outDir,'build.json'), safeJson({ from: capDir, createdAt: new Date().toISOString() }));
+  
+  // Сохраняем обновленный манифест с WS записями
+  await fs.writeFile(path.join(outDir,'manifest.json'), safeJson(manifest));
 
   console.log('[build] ok:', outDir);
 }

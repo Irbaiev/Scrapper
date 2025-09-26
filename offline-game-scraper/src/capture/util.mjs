@@ -24,34 +24,66 @@ export async function writeFileIfChanged(filePath, buf){
   await fs.writeFile(filePath, buf);
 }
 
-// Более умная эвристика «это API, а не статический ассет»
+// ===== нормализация URL (точная и «loose») =====
+export function normUrl(u){
+  try{
+    const x=new URL(u); x.hash='';
+    const pairs=[...x.searchParams.entries()].sort(([a],[b])=>a.localeCompare(b));
+    x.search=''; for(const [k,v] of pairs) x.searchParams.append(k,v);
+    return x.toString();
+  }catch{ return u; }
+}
+
+const VOLATILE = new Set(['token','auth','_','v','ver','verid','cb','cache','t','ts','timestamp']);
+export function normUrlLoose(u){
+  try{
+    const x=new URL(u); x.hash='';
+    const pairs=[...x.searchParams.entries()]
+      .filter(([k])=>!VOLATILE.has(k.toLowerCase()))
+      .sort(([a],[b])=>a.localeCompare(b));
+    x.search=''; for(const [k,v] of pairs) x.searchParams.append(k,v);
+    return x.toString();
+  }catch{ return u; }
+}
+
+// ===== ассет/апи эвристики =====
+export function isStaticJsonPath(p){
+  const s = p.toLowerCase();
+  return s.endsWith('.json') && (
+    s.includes('/assets/')   || s.includes('/renderer/') ||
+    s.includes('/build/')    || s.includes('/manifest')  ||
+    s.includes('/locale/')   || s.includes('/preload/')  ||
+    s.includes('/package.json')
+  );
+}
+
 export function isProbablyApi(contentType, url, method, status){
   const m = String(method||'GET').toUpperCase();
   const ct = String(contentType||'').toLowerCase();
-  const u = new URL(url);
+  const { pathname, hostname } = new URL(url);
 
-  // 1) Любой state-changing/логирующий запрос
-  if (m !== 'GET') return true;              // POST/PUT/PATCH/DELETE → API
+  // все state-changing
+  if (m !== 'GET') return true;
   if (status === 204 && m !== 'GET') return true;
 
-  // 2) JSON не всегда API — отфильтруем очевидные ассеты
-  const pathname = u.pathname.toLowerCase();
-  const isStaticJson = pathname.endsWith('.json') && (
-    pathname.includes('/assets/') || pathname.includes('/renderer/') ||
-    pathname.includes('/build/')  || pathname.includes('/manifest') ||
-    pathname.includes('/locale/') || pathname.includes('/preload/')
-  );
-  if (isStaticJson) return false;
+  // явные API-маркеры
+  const ap = pathname.toLowerCase();
+  const hasMarker = ['/api/','/v1/','/v2/','/graphql','/connect','/token','/interact','/collect','/gameapi','/configuration']
+    .some(k => ap.includes(k));
 
-  // 3) Характерные API-маркеры
-  const apiMarkers = [
-    '/api/', '/v1/', '/v2/', '/token', '/connect', '/interact', '/collect', '/rum',
-    '/ee/', '/identity/', '/config', '/configuration', '/gameapi'
-  ];
-  if (apiMarkers.some(mk => pathname.includes(mk))) return true;
+  if (hasMarker) {
+    // но если это статический JSON ассет — не API
+    if (isStaticJsonPath(pathname)) return false;
+    return true;
+  }
 
-  // 4) По content-type
-  if (ct.includes('application/json') || ct.includes('text/plain')) return true;
+  // content-type
+  if (ct.includes('application/json') || ct.includes('text/plain')) {
+    // JSON-ассеты (конфиги, layout) — не API
+    if (isStaticJsonPath(pathname)) return false;
+    // JSON с «сторонних» доменов (не CDN) — часто API
+    if (!/^(static|cdn|assets?)\./i.test(hostname)) return true;
+  }
 
   return false;
 }

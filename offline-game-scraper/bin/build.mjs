@@ -4,33 +4,17 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import https from 'node:https';
 import http from 'node:http';
+import { normUrl, normUrlLoose, isStaticJsonPath } from '../src/capture/util.mjs';
 
 function parseArgs(argv){ const a={}; for(let i=2;i<argv.length;i++){ const t=argv[i]; if(t.startsWith('--')){ const k=t.slice(2); const v=(i+1<argv.length && !argv[i+1].startsWith('--'))? argv[++i]: true; a[k]=v; } } return a; }
 const safeJson = (x)=> JSON.stringify(x, null, 2);
 const shortHash = (s)=> crypto.createHash('sha1').update(String(s)).digest('hex').slice(0,8);
-const normUrl = (u)=>{ try{ const x=new URL(u); x.hash=''; const p=[...x.searchParams.entries()].sort(([a],[b])=>a.localeCompare(b)); x.search=''; for(const [k,v] of p) x.searchParams.append(k,v); return x.toString(); }catch{ return u; } };
-
-// нормализация URL без «летучих» параметров
-const VOLATILE = new Set(['token','auth','_','v','ver','verId','cb','cache','t','ts','timestamp']);
-function normUrlLoose(u) {
-  try {
-    const x = new URL(u);
-    x.hash = '';
-    // сортируем и выкидываем летучие query
-    const pairs = [...x.searchParams.entries()]
-      .filter(([k]) => !VOLATILE.has(k.toLowerCase()))
-      .sort(([a],[b]) => a.localeCompare(b));
-    x.search = '';
-    for (const [k,v] of pairs) x.searchParams.append(k,v);
-    return x.toString();
-  } catch { return u; }
-}
 const fetchNode = (url, {referer}={}) => new Promise((res, rej) => {
   const mod = url.startsWith('https:') ? https : http;
   const req = mod.get(url, {
     rejectUnauthorized: false,
     headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123 Safari/537.36',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
       ...(referer ? { Referer: referer } : {})
     }
   }, r => {
@@ -63,365 +47,338 @@ async function main(){
   await fs.mkdir(path.join(outDir,'runtime'),{recursive:true});
 
   // -------- 1) ассеты
-  const assetMap = {};   // abs -> assets/<hash>.<ext> (RELATIVE!)
-  const mirrorMap = {};  // abs -> mirror/… (RELATIVE!)
-  for (const [abs, meta] of Object.entries(manifest.assets||{})){
-    const src = path.join(capDir, meta.path);
-    const fname = path.basename(meta.path);
-    await copyEnsure(src, path.join(assetsOut, fname));
-    assetMap[normUrl(abs)] = `assets/${fname}`;
+  // формируем ASSET_MAP только с реальными именами файлов и без дублей
+  const seenAssets = new Set();
+  const assetMap = {}; // abs-normalized -> relative 'assets/<hash>.<ext>'
+
+  for (const [abs, meta] of Object.entries(manifest.assets||{})) {
+    const absNorm = normUrl(abs);
+    const src = path.join(capDir, meta.path); // storage/assets/<hash>.<ext>
+    const rel = path.posix.join('assets', path.basename(meta.path)); // без переименования!
+    if (!seenAssets.has(rel)) {
+      await copyEnsure(src, path.join(outDir, rel));
+      seenAssets.add(rel);
+    }
+    assetMap[absNorm] = rel;
   }
 
-  // -------- 2) PRELOAD внешних (по HTML + CSS + loadScript)
-  const ensureMirror = async (abs, referer) => {
-    const key = normUrl(abs); if (mirrorMap[key]) return;
-    try {
-      const r = await fetchNode(abs, { referer });
-      if (r.status>=200 && r.status<400) {
-        const rel = mirrorRelFor(abs);
-        await fs.mkdir(path.join(outDir, path.dirname(rel)), { recursive: true });
-        await fs.writeFile(path.join(outDir, rel), r.body);
-        mirrorMap[key] = rel; // << RELATIVE (без /)
-      }
-    } catch {}
-  };
+  // -------- 2) строим полный список внешних URL (HTML, CSS, inline, loadScript, srcset, poster, xlink:href)
+  const mirrorMap = {};
+  const extUrls = new Set();
 
   // главный HTML
   const htmlMeta = manifest.assets[manifest.url];
   let html = await fs.readFile(path.join(capDir, htmlMeta.path), 'utf8');
 
-  // вытащим прямые внешние URL из HTML
-  const extUrls = new Set();
-  html.replace(/(?:src|href)=("|'|`)(https?:\/\/[^"'`]+)\1/gi, (_,q,u)=>{ extUrls.add(u); return _; });
-  html.replace(/loadScript\(("|'|`)(https?:\/\/[^"'`]+)\1/gi, (_,q,u)=>{ extUrls.add(u); return _; });
+  // HTML src/href
+  html.replace(/(?:src|href)=["'`](https?:\/\/[^"'`]+)["'`]/gi, (_,u)=>{ extUrls.add(u); return _; });
 
-  // и из всех CSS ассетов
+  // loadScript("…")
+  html.replace(/loadScript\((["'`])(https?:\/\/[^"'`]+)\1/gi, (_,q,u)=>{ extUrls.add(u); return _; });
+
+  // srcset (несколько URL)
+  html.replace(/\s+srcset=(["'])([^"']+)\1/gi, (_,q,val)=>{
+    val.split(',').forEach(part=>{
+      const u = part.trim().split(/\s+/)[0];
+      if(/^https?:\/\//i.test(u)) extUrls.add(u);
+    });
+    return _;
+  });
+
+  // inline style url(...)
+  html.replace(/url\((['"]?)(https?:\/\/[^'")]+)\1\)/gi, (_,q,u)=>{ extUrls.add(u); return _; });
+
+  // xlink:href/use href/poster/source
+  html.replace(/\s+(?:xlink:href|href|poster|data-src|src)=["'`](https?:\/\/[^"'`]+)["'`]/gi, (_,u)=>{ extUrls.add(u); return _; });
+
+  // CSS files: url(...)
   for (const [abs, meta] of Object.entries(manifest.assets||{})){
     if (!/\.css$/i.test(meta.path)) continue;
-    try {
+    try{
       const css = await fs.readFile(path.join(capDir, meta.path), 'utf8');
       let m; const re=/url\((['"]?)(https?:\/\/[^'")]+)\1\)/gi;
       while((m=re.exec(css))) extUrls.add(m[2]);
-    } catch {}
+    }catch{}
   }
-  await Promise.all([...extUrls].map(u => ensureMirror(u, manifest.url)));
 
-  // -------- 3) API/WS карты
+  // prefetch внешки с реферером страницы, заполнение mirrorIndex.json
+  for (const u of extUrls) {
+    const r = await fetchNode(u, { referer: manifest.url }).catch(()=>null);
+    if (r && r.status>=200 && r.status<400) {
+      const rel = mirrorRelFor(u);
+      await fs.mkdir(path.join(outDir, path.dirname(rel)), { recursive: true });
+      await fs.writeFile(path.join(outDir, rel), r.body);
+      mirrorMap[normUrl(u)] = rel; // относительный путь
+    }
+  }
+
+  // -------- 3) API map (из manifest.api)
   const apiMap = [];
-  for (const entry of (manifest.api||[])) {
-    const src = path.join(capDir, entry.file); const base = path.basename(entry.file);
-    await copyEnsure(src, path.join(mocksApiOut, base));
-    const rec = JSON.parse(await fs.readFile(path.join(mocksApiOut, base),'utf8'));
+  for (const e of (manifest.api||[])) {
+    const src = path.join(capDir, e.file);
+    const base = path.basename(e.file);
+    await copyEnsure(src, path.join(outDir,'mocks','api', base));
+    const rec = JSON.parse(await fs.readFile(path.join(outDir,'mocks','api',base),'utf8'));
     apiMap.push({
-      method: (rec.request?.method||'GET').toUpperCase(),
-      url: normUrl(rec.request?.url||entry.url),
+      method: (rec.request?.method||e.method||'GET').toUpperCase(),
+      url: e.urlNorm || normUrl(e.url),
       file: `mocks/api/${base}`,
-      status: rec.response?.status||200,
-      contentType: rec.response?.contentType || rec.response?.headers?.['content-type'] || rec.response?.headers?.['Content-Type'] || 'application/json'
+      contentType: rec.response?.contentType || rec.response?.headers?.['content-type'] || 'application/json'
     });
   }
-  await fs.writeFile(path.join(outDir,'mocks','apiMap.json'), safeJson(apiMap));
 
-  const wsMap = [];
-  for (const entry of (manifest.ws||[])) {
-    const src = path.join(capDir, entry.file); const base = path.basename(entry.file);
-    await copyEnsure(src, path.join(mocksWsOut, base));
-    wsMap.push({ url: normUrl(entry.url), file: `mocks/ws/${base}` });
+  // auto-promote: если apiMap пуст — поднимем «подозрительные» JSON из ассетов
+  if (apiMap.length===0) {
+    for (const [abs, meta] of Object.entries(manifest.assets||{})) {
+      const { pathname, hostname } = new URL(abs);
+      if (!/\.json(\?|$)/i.test(pathname)) continue;
+      if (/^(static|cdn|assets?)\./i.test(hostname)) continue;   // вероятно CDN
+      if (isStaticJsonPath(pathname)) continue;                   // явный ассет-JSON
+
+      // превратим в GET-мок
+      const body = await fs.readFile(path.join(capDir, meta.path));
+      const rec = {
+        time: new Date().toISOString(),
+        request:  { method:'GET', url: abs, headers:{} },
+        response: { status:200, headers:{'content-type':'application/json'}, bodyB64: body.toString('base64') }
+      };
+      const base = `${Date.now()}_${Math.random().toString(36).slice(2)}.json`;
+      await fs.writeFile(path.join(outDir,'mocks','api', base), JSON.stringify(rec,null,2));
+      apiMap.push({ method:'GET', url: normUrl(abs), file:`mocks/api/${base}`, contentType:'application/json' });
+    }
   }
-  await fs.writeFile(path.join(outDir,'mocks','wsMap.json'), safeJson(wsMap));
+  await fs.writeFile(path.join(outDir,'mocks','apiMap.json'), JSON.stringify(apiMap,null,2));
+
+  // WS map
+  const wsMap = [];
+  for (const e of (manifest.ws||[])) {
+    const base = path.basename(e.file);
+    await copyEnsure(path.join(capDir, e.file), path.join(outDir,'mocks','ws', base));
+    wsMap.push({ url: normUrl(e.url), file: `mocks/ws/${base}` });
+  }
+  await fs.writeFile(path.join(outDir,'mocks','wsMap.json'), JSON.stringify(wsMap,null,2));
 
   // -------- 4) Зеркало
   await fs.writeFile(path.join(outDir,'mirrorIndex.json'), safeJson(mirrorMap));
 
   // -------- 5) SW (работает из ЛЮБОЙ подпапки)
-  const sw = `/* auto-generated */
-const ASSET_MAP=${JSON.stringify(assetMap)};
-const API_MAP_PATH='mocks/apiMap.json'; // relative to scope
-const BASE=new URL(self.registration.scope).pathname.replace(/[^/]+$/,'');
-const ASSETS_CACHE='offline-assets-v2';
+  const sw = `/* auto-gen */
+const ASSET_MAP = ${JSON.stringify(assetMap)};
+const API_MAP_PATH = 'mocks/apiMap.json';
+const BASE = new URL(self.registration.scope).pathname.replace(/[^/]+$/, '');
+const ASSETS_CACHE = 'offline-assets-v3';
 
-function log(){/* mute in prod */} // можно включить лог при отладке
+// нормализации
+const VOLATILE = new Set(['token','auth','_','v','ver','verid','cb','cache','t','ts','timestamp']);
+function norm(u){ try{ const x=new URL(u); x.hash=''; const a=[...x.searchParams.entries()].sort(([p],[q])=>p.localeCompare(q)); x.search=''; for(const [k,v] of a) x.searchParams.append(k,v); return x.toString(); }catch{return u} }
+function normLoose(u){ try{ const x=new URL(u); x.hash=''; const a=[...x.searchParams.entries()].filter(([k])=>!VOLATILE.has(k.toLowerCase())).sort(([p],[q])=>p.localeCompare(q)); x.search=''; for(const [k,v] of a) x.searchParams.append(k,v); return x.toString(); }catch{return u} }
 
-function norm(u){try{const x=new URL(u);x.hash='';const a=[...x.searchParams.entries()].sort(([p],[q])=>p.localeCompare(q));x.search='';for(const [k,v] of a)x.searchParams.append(k,v);return x.toString();}catch{return u}}
-
-// нормализация URL без «летучих» параметров
-const VOLATILE = new Set(['token','auth','_','v','ver','cb','cache','t','ts','timestamp']);
-function normLoose(u){ try{
-  const x=new URL(u); x.hash='';
-  const pairs=[...x.searchParams.entries()]
-    .filter(([k])=>!VOLATILE.has(k.toLowerCase()))
-    .sort(([a],[b])=>a.localeCompare(b));
-  x.search=''; for(const [k,v] of pairs) x.searchParams.append(k,v);
-  return x.toString();
-}catch{return u}}
-
-// заглушки для аналитики сразу:
-const text200 = (t,ctype='application/javascript') =>
-  new Response(t,{status:200,headers:{'content-type':ctype}});
-
-// CORS/OPTIONS preflight:
-function cors204(origin='*'){
-  return new Response(null,{status:204,headers:{
-    'access-control-allow-origin': origin,
-    'access-control-allow-credentials': 'true',
-    'access-control-allow-headers': '*,content-type,authorization',
-    'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-  }});
-}
-
-let API_MAP=null; async function getApi(){ if(API_MAP) return API_MAP; const r=await fetch(BASE+API_MAP_PATH).catch(()=>null); API_MAP=r? await r.json(): []; return API_MAP; }
-
+// кэшируем БЕЗ дублей
 self.addEventListener('install', e=>{
   e.waitUntil((async()=>{
     const cache=await caches.open(ASSETS_CACHE);
-    await cache.addAll(Object.values(ASSET_MAP).map(p=> BASE+p));
+    const uniq = Array.from(new Set(Object.values(ASSET_MAP))).map(p=> BASE+p);
+    for (const u of uniq) { try{ await cache.add(u); } catch{} }
   })());
   self.skipWaiting();
 });
 
-self.addEventListener('activate', e=>{ e.waitUntil(self.clients.claim()); });
+self.addEventListener('activate', e=> e.waitUntil(self.clients.claim()));
+
+// helpers
+const text200=(t,ctype='application/javascript')=> new Response(t,{status:200,headers:{'content-type':ctype}});
+function cors204(origin='*'){ return new Response(null,{status:204,headers:{
+  'access-control-allow-origin': origin,
+  'access-control-allow-credentials': 'true',
+  'access-control-allow-headers': '*,content-type,authorization',
+  'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+}});}
+
+let API_MAP=null; async function getApi(){ if(API_MAP) return API_MAP; try{ const r=await fetch(BASE+API_MAP_PATH); API_MAP=await r.json(); }catch{ API_MAP=[]; } return API_MAP; }
 
 self.addEventListener('fetch', (event)=>{
-  const req = event.request;
-  const urlStr = req.url;
-  const u = new URL(urlStr);
-
-  // игнор расширений/девтулз
+  const req=event.request, url=req.url, u=new URL(url);
   if (u.protocol==='chrome-extension:' || u.protocol==='devtools:') return;
 
   event.respondWith((async()=>{
     // preflight
-    if (req.method === 'OPTIONS') return cors204(req.headers.get('origin')||'*');
+    if (req.method==='OPTIONS') return cors204(req.headers.get('origin')||'*');
 
-    // аналитика → заглушка
-    if (u.hostname==='www.googletagmanager.com' || u.hostname==='static.cloudflareinsights.com')
+    // аналитика → заглушка (GET/POST)
+    if (u.hostname==='www.googletagmanager.com' || u.hostname==='static.cloudflareinsights.com' ||
+        u.hostname==='region1.analytics.google.com' || u.hostname==='stats.g.doubleclick.net') {
       return text200('/* offline noop */');
+    }
+    if (/\\/cdn-cgi\\/rum/i.test(u.pathname)) return text200(''); // Cloudflare RUM
 
-    if (u.hostname==='region1.analytics.google.com' || u.hostname==='stats.g.doubleclick.net')
-      return text200('ok');
-
-    // API карта: точное и «loose» совпадение
+    // API моки (точный и loose)
     try{
       const map = await getApi();
-      const method = req.method.toUpperCase();
-      const kExact = map.find(x=> x.method===method && x.url===norm(urlStr));
-      const kLoose = map.find(x=> x.method===method && x.url===normLoose(urlStr));
-      const k = kExact || kLoose;
+      const m = req.method.toUpperCase();
+      const k = map.find(x=> x.method===m && (x.url===norm(url) || x.url===normLoose(url)));
       if (k){
-        const data=await fetch(BASE + k.file);
-        const rec=await data.json();
-        const hdr = new Headers(rec.response?.headers || { 'content-type': k.contentType || 'application/json' });
-        hdr.set('access-control-allow-origin','*');
-        hdr.set('access-control-allow-credentials','true');
-        const b64=rec.response?.bodyB64;
-        const body=b64? Uint8Array.from(atob(b64), c=>c.charCodeAt(0)) : null;
-        return new Response(body, { status: rec.response?.status||200, headers: hdr });
+        const rec = await (await fetch(BASE+k.file)).json();
+        const headers = new Headers(rec.response?.headers || { 'content-type': k.contentType || 'application/json' });
+        headers.set('access-control-allow-origin','*');
+        headers.set('access-control-allow-credentials','true');
+        const b64 = rec.response?.bodyB64;
+        const body = b64 ? Uint8Array.from(atob(b64), c=>c.charCodeAt(0)) : null;
+        return new Response(body, { status: rec.response?.status||200, headers });
       }
-    } catch {}
+    }catch{}
 
-    // ассеты из карты (кэш)
-    const exact = ASSET_MAP[norm(urlStr)] || ASSET_MAP[normLoose(urlStr)];
-    if (exact){
+    // ассеты из карты
+    const key = ASSET_MAP[norm(url)] || ASSET_MAP[normLoose(url)];
+    if (key){
       const cache=await caches.open(ASSETS_CACHE);
-      const hit=await cache.match(BASE + exact);
+      const p = BASE+key;
+      const hit = await cache.match(p);
       if (hit) return hit;
-      try {
-        const r = await fetch(BASE + exact);
-        if (r.ok) { await cache.put(BASE + exact, r.clone()); return r; }
-      } catch {}
+      try{ const r=await fetch(p); if (r.ok){ await cache.put(p, r.clone()); return r; } }catch{}
       return new Response(null,{status:404});
     }
 
-    // попытка «как есть» (онлайн) → если оффлайн — 204
-    try { return await fetch(req); } catch { return new Response(null,{status:204}); }
+    // best-effort: пробуем как есть; если оффлайн — 204
+    try{ return await fetch(req); } catch { return new Response(null,{status:204}); }
   })());
 });`;
   await fs.writeFile(path.join(outDir,'sw.js'), sw);
 
   // -------- 6) runtime/offline.js (вычисляет BASE автоматически)
-  const rt = `/* auto-generated */
+  const rt = `/* auto-gen */
 (()=> {
-  // BASE = путь папки, где лежит offline.js (или документ)
+  // BASE — папка, где лежит offline.js (или документ)
   const script = document.currentScript;
   const BASE = (()=> {
     try{
-      if (script?.src) {
-        const u = new URL(script.src, location.href);
-        return u.pathname.replace(/[^/]+$/, '');
-      }
+      if (script?.src) return new URL(script.src, location.href).pathname.replace(/[^/]+$/, '');
     }catch{}
-    const p = location.pathname.replace(/[^/]+$/, '');
-    return p.endsWith('/')? p : p + '/';
+    return location.pathname.replace(/[^/]+$/, '');
   })();
 
-  function norm(u){ try{ const x=new URL(u, location.href); x.hash=''; const a=[...x.searchParams.entries()].sort(([p],[q])=>p.localeCompare(q)); x.search=''; for(const [k,v] of a)x.searchParams.append(k,v); return x.toString(); } catch { return u; } }
+  // встраиваем mirrorIndex.json как константу (чтобы XHR.open был синхронным)
+  const MIRROR = ${JSON.stringify(mirrorMap, null, 2)};
+  function norm(u){ try{ const x=new URL(u, location.href); x.hash=''; const a=[...x.searchParams.entries()].sort(([p],[q])=>p.localeCompare(q)); x.search=''; for(const [k,v] of a) x.searchParams.append(k,v); return x.toString(); } catch { return u; } }
 
-  // регистрация SW с правильным scope
-  if('serviceWorker' in navigator){
+  // регистрация SW
+  if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register(BASE+'sw.js', { scope: BASE })
-      .then(reg=>{
-        if(!navigator.serviceWorker.controller){
+      .then(reg => {
+        if (!navigator.serviceWorker.controller) {
           navigator.serviceWorker.addEventListener('controllerchange', ()=> location.reload(), { once:true });
-        } else { reg.update().catch(()=>{}); }
+        } else reg.update().catch(()=>{});
       })
       .catch(()=>{});
   }
 
-  // mirrorIndex — относительный к BASE
-  let MIRROR=null; async function getMirror(){ if(MIRROR) return MIRROR; try{ const r=await fetch(BASE+'mirrorIndex.json'); MIRROR=await r.json(); }catch{ MIRROR={}; } return MIRROR; }
-
-  // патч fetch/XHR → если есть локальный mirror, используем его
-  const origFetch = window.fetch.bind(window);
-  window.fetch = async function(input, init){
-    try{
-      const url = typeof input==='string'? input : (input?.url||'');
-      if(/^https?:\/\//i.test(url)){
-        const local = (await getMirror())[norm(url)];
-        if(local && (init?.method||'GET').toUpperCase()==='GET'){ return origFetch(BASE+local, init); }
-      }
-    } catch {}
-    return origFetch(input, init);
-  };
-
-  const origOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(method, url, ...rest){
-    try{
-      if(/^https?:\/\//i.test(url)){
-        getMirror().then(m=>{
-          const n=norm(url); const local=m[n];
-          if(local && String(method||'GET').toUpperCase()==='GET'){
-            try { origOpen.call(this, method, BASE+local, ...rest); } catch { origOpen.call(this, method, url, ...rest); }
-          } else origOpen.call(this, method, url, ...rest);
-        });
-        return;
-      }
-    } catch {}
-    return origOpen.call(this, method, url, ...rest);
-  };
-
-  // помощь: взять локальный путь из mirror
-  async function toLocalIfMirror(u) {
-    try {
-      const m = await getMirror();
-      const key = norm(u);
-      return m[key] ? BASE + m[key] : null;
-    } catch { return null; }
+  // helper: если есть зеркало — верни локальный путь
+  function localFromMirror(u) {
+    const k = norm(u);
+    return MIRROR[k] ? BASE + MIRROR[k] : null;
   }
 
-  // 1) перехват динамических скриптов/стилей
-  (function patchDynamicAssets(){
+  // fetch: синхронная подмена
+  const _fetch = window.fetch.bind(window);
+  window.fetch = function(input, init){
+    try{
+      const url = typeof input==='string' ? input : (input?.url||'');
+      if (/^https?:\\/\\//i.test(url)) {
+        const local = localFromMirror(url);
+        if (local && String((init?.method)||'GET').toUpperCase()==='GET') {
+          return _fetch(local, init);
+        }
+      }
+    }catch{}
+    return _fetch(input, init);
+  };
+
+  // XHR: синхронная подмена (без async race)
+  const _open = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url, ...rest){
+    try{
+      if (/^https?:\\/\\//i.test(url)){
+        const local = localFromMirror(url);
+        if (local && String(method||'GET').toUpperCase()==='GET') {
+          return _open.call(this, method, local, ...rest);
+        }
+      }
+    }catch{}
+    return _open.call(this, method, url, ...rest);
+  };
+
+  // динамические элементы: <script>/<link> и window.loadScript()
+  (function patchDynamic(){
     const origCreate = document.createElement;
     document.createElement = function(tag){
       const el = origCreate.call(document, tag);
-      if (tag.toLowerCase() === 'script') {
-        const d = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
-        if (d && d.set) {
-          Object.defineProperty(el, 'src', {
-            set(v){
-              const setSrc = async () => {
-                const local = /^https?:\/\//i.test(v) ? await toLocalIfMirror(v) : null;
-                d.set.call(el, local || v);
-              };
-              setSrc();
-            },
-            get(){ return d.get.call(el); }
-          });
-        }
+      if (tag.toLowerCase()==='script') {
+        const d = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype,'src');
+        if (d?.set) Object.defineProperty(el,'src',{ set(v){ const l = /^https?:\\/\\//i.test(v) ? localFromMirror(v) : null; d.set.call(el, l||v); }, get(){ return d.get.call(el); }});
       }
-      if (tag.toLowerCase() === 'link') {
-        const d = Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype, 'href');
-        if (d && d.set) {
-          Object.defineProperty(el, 'href', {
-            set(v){
-              const setHref = async () => {
-                const local = /^https?:\/\//i.test(v) ? await toLocalIfMirror(v) : null;
-                d.set.call(el, local || v);
-              };
-              setHref();
-            },
-            get(){ return d.get.call(el); }
-          });
-        }
+      if (tag.toLowerCase()==='link') {
+        const d = Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype,'href');
+        if (d?.set) Object.defineProperty(el,'href',{ set(v){ const l = /^https?:\\/\\//i.test(v) ? localFromMirror(v) : null; d.set.call(el, l||v); }, get(){ return d.get.call(el); }});
       }
       return el;
-    };
+    }
 
-    // глобальный loadScript(fn) если есть
-    if (typeof window.loadScript === 'function' && !window.__patchedLoadScript) {
+    if (typeof window.loadScript==='function' && !window.__patchedLoadScript) {
       const orig = window.loadScript;
-      window.loadScript = async function(u, cb){
-        try {
-          const local = /^https?:\/\//i.test(u) ? await toLocalIfMirror(u) : null;
-          return orig.call(this, local || u, cb);
-        } catch { return orig.apply(this, arguments); }
+      window.loadScript = function(u, cb){
+        try { const l = /^https?:\\/\\//i.test(u) ? localFromMirror(u) : null; return orig.call(this, l||u, cb); }
+        catch { return orig.apply(this, arguments); }
       };
       window.__patchedLoadScript = true;
     }
   })();
-
-  // VERY BASIC WS MOCK (only keeps client happy). Disable if real ws mocks added.
-  (function basicWsMock(){
-    if (!window.__enableBasicWsMock) return; // включай вручную при надобности
-    const NativeWS = window.WebSocket;
-    window.WebSocket = class extends NativeWS {
-      constructor(url, protocols){
-        // рвём исходное соединение и делаем «локальный»
-        super('ws://invalid.local/', protocols);
-        setTimeout(()=> this.dispatchEvent(new Event('open')), 10);
-
-        // пинг/понг: если клиент шлёт "ping" (текст) — отвечаем "pong"
-        this.addEventListener('message', (e)=>{
-          if (typeof e.data === 'string' && /ping/i.test(e.data)) {
-            setTimeout(()=> this.dispatchEvent(new MessageEvent('message', { data: 'pong' })), 50);
-          }
-        });
-
-        // закрытие по навигации
-        window.addEventListener('beforeunload', ()=> this.close());
-      }
-    };
-  })();
 })();`;
   await fs.writeFile(path.join(outDir,'runtime','offline.js'), rt);
 
-  // -------- 7) HTML: инъекция offline.js + перепись ссылок на mirror (RELATIVE!)
+  // -------- 7) HTML: фикс meta viewport, инъекция offline.js + перепись ссылок на mirror (RELATIVE!)
+  
+  // фикс meta viewport (точка с запятой → запятая)
+  html = html.replace(
+    /<meta\s+name=["']viewport["']\s+content=["']([^"']+)["']\s*\/?>/i,
+    (m,content)=>{
+      const fixed = content.replace(/;\s*/g, ', ');
+      return m.replace(content, fixed);
+    }
+  );
+
   const inject = `\n  <script src="runtime/offline.js"></script>\n`; // относительный путь
   let outHtml = html;
   if(/<head[^>]*>/i.test(outHtml)) outHtml = outHtml.replace(/<head[^>]*>/i, m=> m + inject);
   else outHtml = inject + outHtml;
 
-  // replace src/href/img → mirror/… (relative)
-  const replAttr = (tag, attr) => {
-    const re = new RegExp(`<${tag}[^>]*?${attr}=(["'\`])(https?:\/\/[^"'\`]+)\\1`, 'gi');
-    outHtml = outHtml.replace(re, (m, q, abs)=>{
+  // общее преобразование атрибутов
+  function replaceAttr(tag, attr){
+    const re = new RegExp(`<${tag}[^>]*?${attr}=(["'\\\`])(https?:\\/\\/[^"'\\\`]+)\\1`, 'gi');
+    outHtml = outHtml.replace(re, (m,q,abs)=>{
       const local = mirrorMap[normUrl(abs)];
       return local ? m.replace(abs, local) : m;
     });
-  };
-  replAttr('script','src');
-  replAttr('link','href');
-  replAttr('img','src');
-  replAttr('img','srcset');
-  replAttr('source','src');
-  replAttr('video','poster');
-  replAttr('iframe','src');
-  replAttr('use','href'); // <use href="…"> (и xlink:href, если нужно)
-  outHtml = outHtml.replace(/\s+xlink:href=(["'`])(https?:\/\/[^"'`]+)\1/gi,
-    (m,q,abs)=> { const local = mirrorMap[normUrl(abs)]; return local ? m.replace(abs, local) : m; });
+  }
+  ['script','link','img','iframe','source','video'].forEach(t=>{
+    replaceAttr(t,'src'); if (t==='link') replaceAttr('link','href'); if (t==='video') replaceAttr('video','poster');
+  });
 
-  // inline style url(...)
+  // srcset
+  outHtml = outHtml.replace(/\s+srcset=(["'])([^"']+)\1/gi, (m,q,val)=>{
+    const parts = val.split(',').map(p=>{
+      const [u, d] = p.trim().split(/\s+/,2);
+      const local = /^https?:\/\//i.test(u) ? mirrorMap[normUrl(u)] : null;
+      return (local||u) + (d?(' '+d):'');
+    });
+    return ` srcset="${parts.join(', ')}"`;
+  });
+
+  // inline url(...)
   outHtml = outHtml.replace(/url\((['"]?)(https?:\/\/[^'")]+)\1\)/gi,
     (m,q,abs)=> { const local = mirrorMap[normUrl(abs)]; return local ? m.replace(abs, local) : m; });
 
-  // простое @import 'https://…'
-  outHtml = outHtml.replace(/@import\s+(?:url\()?(['"])(https?:\/\/[^'"]+)\1\)?/gi,
-    (m,q,abs)=> { const local = mirrorMap[normUrl(abs)]; return local ? m.replace(abs, local) : m; });
-
-  // loadScript('https://…') → mirror/…
-  outHtml = outHtml.replace(/loadScript\((["'`])(https?:\/\/[^"'`]+)\1\)/gi, (m,q,abs)=>{
-    const local = mirrorMap[normUrl(abs)];
-    return local ? m.replace(abs, local) : m;
-    });
+  // xlink:href / <use href>
+  outHtml = outHtml.replace(/\s+(xlink:href|href)=(["'])(https?:\/\/[^"']+)\2/gi,
+    (m,attr,q,abs)=>{ const local = mirrorMap[normUrl(abs)]; return local ? m.replace(abs, local) : m; });
 
   await fs.writeFile(path.join(outDir,'index.html'), outHtml);
   await fs.writeFile(path.join(outDir,'build.json'), safeJson({ from: capDir, createdAt: new Date().toISOString() }));

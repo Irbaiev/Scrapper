@@ -2,7 +2,7 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { chromium } from 'playwright';
-import { sha256, ensureDir, safeJson, isProbablyApi, pickExt, writeFileIfChanged, nowTs } from './util.mjs';
+import { sha256, ensureDir, safeJson, isProbablyApi, pickExt, writeFileIfChanged, nowTs, normUrl, normUrlLoose, isStaticJsonPath } from './util.mjs';
 import { autoInteract } from './interact.mjs';
 
 export async function capture(url, {
@@ -14,7 +14,8 @@ export async function capture(url, {
   loadAll = false,
   __dirname,
   safeName,
-  appendNdjson
+  appendNdjson,
+  attachCdpNetworkSniffer     // CDP-сниффер для WS
 } = {}) {
 
   const storageDir = path.join(outDir, 'storage');
@@ -40,19 +41,29 @@ export async function capture(url, {
     await jlog({ phase: 'scenario.start', sc });
 
     const browser = await chromium.launch({
-      headless,
-      args: ['--disable-blink-features=AutomationControlled'],
+      headless: false, // для лучшего захвата WS
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--mute-audio',
+      ]
     });
     const context = await browser.newContext({
       acceptDownloads: true,
       ignoreHTTPSErrors: true,
-      viewport: sc === 'mobile' ? { width: 390, height: 780 } : { width: 1600, height: 900 },
-      userAgent: sc === 'mobile'
-        ? 'Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36'
-        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+      viewport: sc === 'mobile' ? { width: 390, height: 780 } : { width: 1366, height: 768 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
+      locale: 'en-US',
+      timezoneId: 'Europe/Bucharest',
       javaScriptEnabled: true,
       serviceWorkers: 'allow',
+      permissions: ['clipboard-read', 'clipboard-write'],
     });
+
+    // CDP-сниффер для WS из iframe и WebWorkers
+    let disposeCdp = null;
+    if (attachCdpNetworkSniffer) {
+      disposeCdp = await attachCdpNetworkSniffer(browser, outDir, manifest, counts);
+    }
 
     // минимальная антибот-маскировка
     await context.addInitScript(() => {
@@ -107,111 +118,74 @@ export async function capture(url, {
 
     // === WebSocket: ловим на уровне контекста ===
     context.on('websocket', (ws) => {
-      const rec = { url: ws.url(), frames:[], created: Date.now() };
-      ws.on('framereceived', d => rec.frames.push({dir:'in', t:Date.now(), dataType: typeof d, payload: typeof d==='string'? d : Buffer.from(d).toString('base64')}));
-      ws.on('framesent', d => rec.frames.push({dir:'out',t:Date.now(), dataType: typeof d, payload: typeof d==='string'? d : Buffer.from(d).toString('base64')}));
+      const rec = { url: ws.url(), frames: [], created: Date.now() };
+      ws.on('framereceived', d => rec.frames.push({dir:'in',  t:Date.now(), opcode: typeof d==='string'?1:2, payload: typeof d==='string'? d : Buffer.from(d).toString('base64')}));
+      ws.on('framesent',     d => rec.frames.push({dir:'out', t:Date.now(), opcode: typeof d==='string'?1:2, payload: typeof d==='string'? d : Buffer.from(d).toString('base64')}));
       ws.on('close', async () => {
         const out = path.join(wsDir, `${Date.now()}_${Math.random().toString(36).slice(2)}.json`);
-        await fs.writeFile(out, JSON.stringify(rec, null, 2));
-        manifest.ws.push({ url: rec.url, file: path.relative(outDir, out).replace(/\\/g,'/')});
+        await fs.writeFile(out, JSON.stringify(rec,null,2));
+        manifest.ws.push({ url: rec.url, file: path.relative(outDir, out).replace(/\\/g,'/') });
         counts.ws++;
         await jlog({ ev: 'ws.saved', url: rec.url, frames: rec.frames.length });
       });
     });
 
-    // === API: ловим на уровне контекста (включая cross-origin iframe) ===
+    // === API/ассеты — вешаемся на context, не только page ===
     context.on('response', async (resp) => {
-      try {
+      try{
         const req = resp.request();
         const url = resp.url();
-        const type = req.resourceType();
-        const ct = (resp.headers()['content-type'] || '').toLowerCase();
-        
-        // считаем API любые XHR/fetch ИЛИ JSON не из каталога assets/renderer/build/…
-        const isX = (type==='xhr' || type==='fetch');
-        const isJson = ct.includes('application/json');
-        if (!isX && !isJson) return;
+        const method = req.method();
+        const status = resp.status();
+        const headers = resp.headers();
+        const ct = headers['content-type'] || headers['Content-Type'] || '';
+        if (/^(data:|chrome-extension:)/i.test(url)) return;
 
-        const u = new URL(url);
-        const body = await resp.body().catch(() => null);
+        // тело
+        let body = Buffer.alloc(0);
+        try { body = await resp.body(); } catch {}
 
-        // Куда сохранять
-        const baseDir = path.join(outDir, 'api', safeName(u.host), ...u.pathname.split('/').map(safeName));
-        const leaf = u.search ? safeName(u.search) : '';
-        const ext = ct.includes('json') ? '.json' : (ct.includes('text') ? '.txt' : '.bin');
-        const file = path.join(baseDir, (leaf || 'index') + ext);
+        // API?
+        if (isProbablyApi(ct, url, method, status)) {
+          let reqBody = null;
+          try { reqBody = req.postDataBuffer(); } catch {}
+          const record = {
+            time: nowTs(),
+            request: { method, url, headers: req.headers(), bodyB64: reqBody ? Buffer.from(reqBody).toString('base64') : null },
+            response:{ status, headers, contentType: ct, bodyB64: Buffer.from(body).toString('base64') }
+          };
+          const fname = path.join(apiDir, `${Date.now()}_${Math.random().toString(36).slice(2)}.json`);
+          await fs.writeFile(fname, JSON.stringify(record,null,2));
+          manifest.api.push({ url, urlNorm: normUrl(url), urlLoose: normUrlLoose(url), method, status,
+            file: path.relative(outDir, fname).replace(/\\/g,'/') });
+          counts.api++;
+          return;
+        }
 
-        await fs.mkdir(path.dirname(file), { recursive: true });
-        if (body) await fs.writeFile(file, body);
-
-        // мета на всякий случай
-        const meta = {
-          method: req.method(),
-          status: resp.status(),
-          headers: resp.headers(),
-          ct,
-          url
-        };
-        await fs.writeFile(file + '.meta.json', JSON.stringify(meta, null, 2));
-        
-        // Добавить в manifest.api
-        manifest.api.push({
-          url: url,
-          method: req.method(),
-          status: resp.status(),
-          file: path.relative(outDir, file).replace(/\\/g,'/')
-        });
-        
-        // Обновляем счетчики
-        counts.api++;
-        await jlog({ ev: 'api.saved', url, method: req.method(), status: resp.status(), file });
-      } catch (e) {
-        await jlog({ ev: 'api.error', error: String(e) });
+        // ассеты (всё остальное)
+        const hash = sha256(body);
+        const ext  = pickExt(url, ct);
+        const rel  = path.join('storage','assets', `${hash}.${ext}`);
+        await writeFileIfChanged(path.join(outDir, rel), body);
+        if (!manifest.assets[url]) {
+          manifest.assets[url] = {
+            path: rel.replace(/\\/g,'/'),
+            sha256: hash,
+            size: body.length,
+            status, headers, contentType: ct
+          };
+          counts.assets++;
+        }
+      }catch(e){
+        manifest.errors.push({ type:'response', url: resp.url(), message: String(e) }); counts.errors++;
       }
     });
 
-    // === Network: сбор ассетов (не API/WS) ===
+    // === Network: отслеживание ошибок ===
     const failed = [];
     page.on('requestfailed', (req) => {
       failed.push({ url: req.url(), method: req.method(), failure: req.failure()?.errorText || 'failed' });
       jlog({ ev: 'requestfailed', url: req.url(), method: req.method(), err: req.failure()?.errorText });
-    });
-
-    page.on('response', async (resp) => {
-      const req = resp.request();
-      const method = req.method();
-      const absUrl = req.url();
-      try {
-        const status = resp.status();
-        const headers = resp.headers();
-        const contentType = headers['content-type'] || headers['Content-Type'] || '';
-
-        if (/^(data:|chrome-extension:)/i.test(absUrl)) return;
-
-        // тело ответа
-        let body; try { body = await resp.body(); } catch { body = Buffer.alloc(0); }
-
-        // Только ассеты (API и WS обрабатываются хуками выше)
-        const hash = sha256(body);
-        const ext = pickExt(absUrl, contentType);
-        const rel = path.join('storage', 'assets', `${hash}.${ext}`);
-        await writeFileIfChanged(path.join(outDir, rel), body);
-        if (!manifest.assets[absUrl]) {
-          manifest.assets[absUrl] = {
-            path: rel.replace(/\\/g,'/'),
-            sha256: hash,
-            size: body.length,
-            status,
-            headers,
-            contentType
-          };
-          counts.assets++;
-        }
-      } catch (e) {
-        manifest.errors.push({ type: 'response', url: absUrl, message: String(e) });
-        counts.errors++;
-        await jlog({ ev: 'error.response', url: absUrl, error: String(e) });
-      }
     });
 
     // Навигация с явными таймаутами
@@ -221,8 +195,79 @@ export async function capture(url, {
 
     try { await page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
 
+    // Ждем выполнения JavaScript и появления iframe для автоматических игр
+    try {
+      // Ждем выполнения основного JavaScript
+      await page.waitForTimeout(5000);
+      
+      // Принудительно выполняем JavaScript, который может создавать iframe
+      await page.evaluate(() => {
+        // Ищем функции, которые могут создавать iframe
+        if (typeof window.loadScript === 'function') {
+          try { window.loadScript('https://static.casino.guru/res/51b4b89e718381e2f9a228c43123b76ba/build/es6/appGame.es6.js'); } catch {}
+        }
+        // Ждем немного для выполнения
+        return new Promise(resolve => setTimeout(resolve, 3000));
+      });
+      
+      // Ждем появления iframe (может создаваться динамически)
+      await page.waitForSelector('iframe', { timeout: 20000 }).catch(() => {});
+      
+      // Ждем загрузки iframe
+      const iframes = page.locator('iframe');
+      const count = await iframes.count().catch(() => 0);
+      for (let i = 0; i < count; i++) {
+        try {
+          await iframes.nth(i).waitFor({ state: 'attached', timeout: 10000 });
+          await page.waitForTimeout(5000); // Дополнительное время для загрузки контента iframe
+        } catch {}
+      }
+      
+      // Для автоматических игр - ждем первый раунд (10+ секунд)
+      await page.waitForTimeout(15000);
+      
+      // Ждем загрузки ресурсов iframe
+      try {
+        const frames = page.frames();
+        for (const frame of frames) {
+          const frameUrl = frame.url();
+          if (frameUrl && !frameUrl.startsWith('about:') && frameUrl.includes('staging.playzia.com')) {
+            console.log('Waiting for iframe resources:', frameUrl);
+            // Ждем загрузки ресурсов iframe
+            await frame.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+            await page.waitForTimeout(5000); // Дополнительное время
+            
+            // Принудительно загружаем ресурсы iframe
+            const baseUrl = frameUrl.replace(/\/[^\/]*$/, '/');
+            const iframeResources = [
+              'wrapper.css',
+              'js/jquery.min.js', 
+              'js/wrapper.js'
+            ];
+            
+            for (const resource of iframeResources) {
+              const fullUrl = baseUrl + resource;
+              try {
+                console.log('Fetching iframe resource:', fullUrl);
+                await context.request.get(fullUrl, { timeout: 10000 });
+              } catch (e) {
+                console.log('Failed to fetch iframe resource:', fullUrl, e.message);
+              }
+            }
+          }
+        }
+      } catch {}
+    } catch {}
+
     // Авто-интерактивность (в т.ч. клики внутрь iframe)
-    if (interact === 'auto') { try { await autoInteract(page); } catch {} }
+    let stopInteract = null;
+    if (interact === 'auto') { 
+      try { 
+        stopInteract = await autoInteract(page, { everyMs: 4000, iframeHints: ['staging.', 'turbogames.'] });
+        // Дополнительное время для загрузки контента после интерактивности
+        await page.waitForTimeout(10000);
+      } catch {} 
+    }
 
     // Принудительная догрузка fallback-бандлов
     if (loadAll) {
@@ -302,6 +347,8 @@ export async function capture(url, {
     await jlog({ phase: 'scenario.end', sc });
 
     // Закрытие
+    try { stopInteract?.(); } catch {}
+    try { disposeCdp?.(); } catch {}
     try { await context.close(); } catch {}
     try { await browser.close(); } catch {}
   }

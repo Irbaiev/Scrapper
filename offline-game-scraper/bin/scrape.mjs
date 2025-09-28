@@ -3,6 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { capture } from '../src/capture/capture.mjs';
+import { attachCdpNetworkSniffer } from '../src/capture/cdp-sniffer.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -60,6 +61,7 @@ function slugFromUrl(u) {
     __dirname,
     safeName,
     appendNdjson,
+    attachCdpNetworkSniffer,
   });
 
   console.log('\n[done] saved to:', outDir);

@@ -3,14 +3,24 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "capture": "node tools/capture-playwright.cjs --url \"https://casino.guru/gameDetailIos?gameId=25721\" --out capture/bananza",
+    "extract": "node tools/extract-mock-requests.cjs --har capture/bananza.har --cdp capture/bananza.cdp.json --out mocks --save-responses",
+    "build": "node build.mjs",
+    "preflight": "node tools/preflight.cjs --dist dist/bananza-v2",
+    "serve": "node tools/serve.cjs --dir dist/bananza-v2 --port 8080",
+    "validate": "node tools/validate-playwright.js --url http://localhost:8080/index.html --out logs/diag.json",
+    "offline": "npm run build && npm run preflight && npm run serve && npm run validate",
     "scrape": "node bin/scrape.mjs",
-    "build": "node bin/build.mjs",
-    "serve": "node bin/serve.mjs",
     "enhance": "node bin/enhance.mjs",
-    "validate": "node bin/validate.mjs"
+    "preflight-universal": "node tools/universal-preflight.mjs"
   },
   "dependencies": {
     "mime-types": "^2.1.35",
     "playwright": "^1.45.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.47.0",
+    "esbuild": "^0.23.0",
+    "minimist": "^1.2.8"
   }
 }

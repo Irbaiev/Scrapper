@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import { chromium } from 'playwright';
 import { sha256, ensureDir, safeJson, isProbablyApi, pickExt, writeFileIfChanged, nowTs, normUrl, normUrlLoose, isStaticJsonPath } from './util.mjs';
 import { autoInteract } from './interact.mjs';
+import { launchStealthContext } from './launch.mjs';
 
 export async function capture(url, {
   outDir,
@@ -40,23 +41,11 @@ export async function capture(url, {
   for (const sc of scenarios) {
     await jlog({ phase: 'scenario.start', sc });
 
-    const browser = await chromium.launch({
-      headless: false, // для лучшего захвата WS
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--mute-audio',
-      ]
-    });
-    const context = await browser.newContext({
-      acceptDownloads: true,
-      ignoreHTTPSErrors: true,
-      viewport: sc === 'mobile' ? { width: 390, height: 780 } : { width: 1366, height: 768 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
-      locale: 'en-US',
+    // Используем stealth браузер
+    const { browser, context } = await launchStealthContext({ 
+      headless: headless,
       timezoneId: 'Europe/Bucharest',
-      javaScriptEnabled: true,
-      serviceWorkers: 'allow',
-      permissions: ['clipboard-read', 'clipboard-write'],
+      locale: 'en-US'
     });
 
     // CDP-сниффер для WS из iframe и WebWorkers
@@ -64,6 +53,10 @@ export async function capture(url, {
     if (attachCdpNetworkSniffer) {
       disposeCdp = await attachCdpNetworkSniffer(browser, outDir, manifest, counts);
     }
+
+    // CDP сниффер для WebSocket
+    const wsConnections = new Map();
+    let cdpClient = null;
 
     // минимальная антибот-маскировка
     await context.addInitScript(() => {
@@ -78,6 +71,93 @@ export async function capture(url, {
     }
 
     const page = await context.newPage();
+
+    // Прикрепляем CDP сниффер к странице
+    cdpClient = await context.newCDPSession(page);
+    await cdpClient.send('Network.enable');
+    
+    cdpClient.on('Network.webSocketCreated', (data) => {
+      const wsId = data.requestId;
+      const url = data.url;
+      wsConnections.set(wsId, {
+        url,
+        frames: [],
+        created: Date.now()
+      });
+      console.log(`[cdp] WebSocket created: ${url}`);
+    });
+
+    cdpClient.on('Network.webSocketFrameSent', (data) => {
+      const ws = wsConnections.get(data.requestId);
+      if (ws) {
+        ws.frames.push({
+          ts: data.timestamp,
+          dir: 'out',
+          opcode: data.response.opcode,
+          text: data.response.payloadData,
+          base64: null
+        });
+      }
+    });
+
+    cdpClient.on('Network.webSocketFrameReceived', (data) => {
+      const ws = wsConnections.get(data.requestId);
+      if (ws) {
+        ws.frames.push({
+          ts: data.timestamp,
+          dir: 'in',
+          opcode: data.response.opcode,
+          text: data.response.payloadData,
+          base64: null
+        });
+      }
+    });
+
+    cdpClient.on('Network.webSocketClosed', async (data) => {
+      const ws = wsConnections.get(data.requestId);
+      if (ws && ws.frames.length > 0) {
+        const urlObj = new URL(ws.url);
+        const hostDir = path.join(outDir, 'ws', urlObj.hostname);
+        const wsDir2 = path.join(hostDir, 'ws');
+        const gameDir = path.join(wsDir2, urlObj.pathname.split('/').pop() || 'default');
+        
+        await fs.mkdir(gameDir, { recursive: true });
+        
+        const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.ndjson`;
+        const filepath = path.join(gameDir, filename);
+        
+        for (const frame of ws.frames) {
+          await fs.appendFile(filepath, JSON.stringify(frame) + '\n');
+        }
+        
+        manifest.ws.push({
+          url: ws.url,
+          file: path.relative(outDir, filepath).replace(/\\/g, '/')
+        });
+        
+        counts.ws++;
+        console.log(`[cdp] WebSocket saved: ${ws.url} (${ws.frames.length} frames)`);
+      }
+      wsConnections.delete(data.requestId);
+    });
+
+    // === Разрешаем все ресурсы (отключаем блокировку) ===
+    await page.route('**/*', async (route) => {
+      try {
+        await route.continue();
+      } catch (e) {
+        // Игнорируем ошибки маршрутизации
+      }
+    });
+    
+    // Дополнительно отключаем блокировку на уровне контекста
+    await context.route('**/*', async (route) => {
+      try {
+        await route.continue();
+      } catch (e) {
+        // Игнорируем ошибки маршрутизации
+      }
+    });
 
     // === WebSocket хук: инжектируем до навигации ===
     await context.exposeBinding('__wsTap', async (_source, payload) => {
@@ -190,10 +270,69 @@ export async function capture(url, {
 
     // Навигация с явными таймаутами
     await jlog({ phase: 'goto', url });
-    try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }); }
-    catch (e) { await jlog({ phase: 'goto.error', error: String(e) }); }
+    try { 
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 120000 }); 
+      await jlog({ ev: 'goto.success', url });
+    }
+    catch (e) { 
+      await jlog({ phase: 'goto.error', error: String(e) }); 
+      // Продолжаем даже если навигация не удалась
+    }
 
-    try { await page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
+    // Если это страница casino.guru с iframe игры — ждём самого iframe
+    const frame = await (async () => {
+      // подождать, пока появится iframe с index.html?access_token=...
+      await page.waitForTimeout(1000);
+      let f = page
+        .frames()
+        .find(fr => /index\.html\?access_token=/.test(fr.url()));
+      if (!f) {
+        try {
+          await page.waitForFunction(() =>
+            Array.from(document.querySelectorAll('iframe'))
+                 .some(f => /index\.html\?access_token=/.test(f.src)), { timeout: 10000 });
+          f = page
+            .frames()
+            .find(fr => /index\.html\?access_token=/.test(fr.url()));
+        } catch (e) {
+          await jlog({ ev: 'iframe.wait.timeout', err: e.message });
+        }
+      }
+      return f ?? page.mainFrame();
+    })();
+
+    await jlog({ ev: 'frame.selected', url: frame.url() });
+
+    // Часто у игр есть «Play/Start/Continue» — попробуем кликнуть
+    try {
+      await Promise.race([
+        frame.click('text=/^(Play|Start|Continue)$/i', { timeout: 3000 }),
+        frame.click('button:has-text("Play")', { timeout: 3000 }),
+      ]).catch(() => {});
+      await jlog({ ev: 'play.button.clicked' });
+    } catch (e) {
+      await jlog({ ev: 'play.button.not.found', err: e.message });
+    }
+
+    // Ждём реальной инициализации (canvas или прогресс > 0)
+    try {
+      await frame.waitForFunction(() => {
+        const canvas = document.querySelector('canvas');
+        const hidden = !!document.querySelector('[aria-hidden="true"]');
+        const ready = document.readyState === 'complete';
+        return (canvas && canvas.width > 0 && canvas.height > 0 && !hidden) || ready;
+      }, { timeout: 120000 });
+      await jlog({ ev: 'game.initialized' });
+    } catch (e) {
+      await jlog({ ev: 'game.init.timeout', err: e.message });
+    }
+
+    try { 
+      await page.waitForLoadState('networkidle', { timeout: 30000 }); 
+      await jlog({ ev: 'networkidle.success' });
+    } catch (e) {
+      await jlog({ ev: 'networkidle.timeout', err: e.message });
+    }
 
     // Ждем выполнения JavaScript и появления iframe для автоматических игр
     try {
